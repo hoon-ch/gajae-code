@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
-import type { Settings } from "../src/config/settings";
 import { getNotificationConfig } from "../src/notifications/config";
 import { createLightweightDaemonSettings } from "../src/notifications/telegram-daemon-cli";
 
@@ -13,7 +12,7 @@ import { createLightweightDaemonSettings } from "../src/notifications/telegram-d
 // path end-to-end (raw YAML object -> getNotificationConfig.rich).
 function cfgFromRaw(rawConfig: unknown) {
 	const settings = createLightweightDaemonSettings({ agentDir: "/tmp/gjc-rich-config", rawConfig });
-	return getNotificationConfig(settings as Settings);
+	return getNotificationConfig(settings);
 }
 
 describe("notifications daemon config reachability (rich)", () => {

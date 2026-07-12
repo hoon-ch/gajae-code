@@ -707,7 +707,7 @@ describe("notify daemon-internal lightweight startup", () => {
 		);
 
 		const settings = await loadLightweightDaemonSettings(agentDir);
-		const cfg = getNotificationConfig(settings as Settings);
+		const cfg = getNotificationConfig(settings);
 		expect(settings.getAgentDir()).toBe(agentDir);
 		expect(cfg.enabled).toBe(true);
 		expect(cfg.botToken).toBe("1234:token");
@@ -719,7 +719,7 @@ describe("notify daemon-internal lightweight startup", () => {
 
 	test("lightweight daemon settings fall back to safe notification defaults", () => {
 		const settings = createLightweightDaemonSettings({ agentDir: "/tmp/gjc-agent", rawConfig: {} });
-		const cfg = getNotificationConfig(settings as Settings);
+		const cfg = getNotificationConfig(settings);
 		expect(cfg.enabled).toBe(false);
 		expect(cfg.botToken).toBeUndefined();
 		expect(cfg.chatId).toBeUndefined();

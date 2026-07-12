@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
-import { resetSettingsForTest, Settings } from "../src/config/settings";
+import { logger } from "@gajae-code/utils";
+import { NotificationSettingsOverrideError, resetSettingsForTest, Settings } from "../src/config/settings";
 import {
 	buildRedactedAction,
 	completionNotifyDisabledByEnv,
@@ -20,6 +21,7 @@ import {
 } from "../src/notifications/config";
 import { createNotificationsExtension } from "../src/notifications/index";
 import { daemonPaths } from "../src/notifications/telegram-daemon";
+import { createLightweightDaemonSettings } from "../src/notifications/telegram-daemon-cli";
 import { createAgentSession } from "../src/sdk";
 import { SessionManager } from "../src/session/session-manager";
 
@@ -110,6 +112,116 @@ describe("notifications config", () => {
 			},
 			idleTimeoutMs: 1234,
 		});
+	});
+
+	test("full Settings and the lightweight daemon resolve the same global notification snapshot", () => {
+		const globalSettings = {
+			"notifications.enabled": true,
+			"notifications.telegram.botToken": "telegram-token",
+			"notifications.telegram.chatId": "telegram-chat",
+			"notifications.telegram.rich.enabled": false,
+			"notifications.telegram.richDraft.enabled": true,
+			"notifications.telegram.topics.nameTemplate": "{repo}/{branch}",
+			"notifications.discord.botToken": "discord-token",
+			"notifications.discord.channelId": "discord-channel",
+			"notifications.slack.botToken": "slack-token",
+			"notifications.slack.channelId": "slack-channel",
+			"notifications.redact": true,
+			"notifications.verbosity": "verbose" as const,
+			"notifications.sessionScope": "primary" as const,
+			"notifications.daemon.idleTimeoutMs": 1234,
+		};
+		const settings = Settings.isolated(globalSettings);
+		const lightweight = createLightweightDaemonSettings({
+			agentDir: "/tmp/gjc-notification-snapshot",
+			rawConfig: {
+				notifications: {
+					enabled: true,
+					telegram: {
+						botToken: "telegram-token",
+						chatId: "telegram-chat",
+						rich: { enabled: false },
+						richDraft: { enabled: true },
+						topics: { nameTemplate: "{repo}/{branch}" },
+					},
+					discord: { botToken: "discord-token", channelId: "discord-channel" },
+					slack: { botToken: "slack-token", channelId: "slack-channel" },
+					redact: true,
+					verbosity: "verbose",
+					sessionScope: "primary",
+					daemon: { idleTimeoutMs: 1234 },
+				},
+			},
+		});
+
+		expect(settings.getNotificationSettingsSnapshot()).toEqual(lightweight.getNotificationSettingsSnapshot());
+		expect(getNotificationConfig(settings)).toEqual(getNotificationConfig(lightweight));
+	});
+
+	test("project notification settings are ignored without leaking credentials", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-project-boundary-"));
+		tempDirs.push(root);
+		const agentDir = path.join(root, "agent");
+		const projectDir = path.join(root, "project");
+		const projectSettingsPath = path.join(projectDir, ".gjc", "settings.json");
+		const projectToken = "project-secret-token";
+		fs.mkdirSync(path.dirname(projectSettingsPath), { recursive: true });
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			`notifications:\n  enabled: true\n  telegram:\n    botToken: global-token\n    chatId: global-chat\n`,
+		);
+		fs.writeFileSync(
+			projectSettingsPath,
+			JSON.stringify({
+				notifications: {
+					enabled: false,
+					telegram: { botToken: projectToken, chatId: "project-chat" },
+				},
+			}),
+		);
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		try {
+			resetSettingsForTest();
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(getNotificationConfig(settings)).toMatchObject({
+				enabled: true,
+				botToken: "global-token",
+				chatId: "global-chat",
+			});
+
+			const warnings = warnSpy.mock.calls.filter(
+				call => call[0] === "Settings: ignoring project notification settings",
+			);
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0]?.[1]).toEqual({ path: projectSettingsPath });
+			expect(JSON.stringify(warnings)).not.toContain(projectToken);
+		} finally {
+			warnSpy.mockRestore();
+			resetSettingsForTest();
+		}
+	});
+
+	test("runtime notification overrides are rejected without exposing their value", () => {
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.telegram.botToken": "global-token",
+			"notifications.telegram.chatId": "global-chat",
+		});
+		const runtimeToken = "runtime-secret-token";
+		let thrown: unknown;
+
+		try {
+			settings.override("notifications.telegram.botToken", runtimeToken);
+		} catch (error) {
+			thrown = error;
+		}
+
+		expect(thrown).toBeInstanceOf(NotificationSettingsOverrideError);
+		expect(String(thrown)).not.toContain(runtimeToken);
+		expect(JSON.stringify(thrown)).not.toContain(runtimeToken);
+		expect(getNotificationConfig(settings)).toMatchObject({ botToken: "global-token", chatId: "global-chat" });
 	});
 
 	test("isGloballyConfigured is true when enabled with any complete adapter", () => {

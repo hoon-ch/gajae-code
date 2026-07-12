@@ -7,10 +7,9 @@
  *   const enabled = settings.get("compaction.enabled");  // sync read
  *   settings.set("theme.dark", "red-claw");              // sync write, saves in background
  *
- * For tests:
+ * For tests, `Settings.isolated()` seeds explicit user/global settings:
  *   const isolated = Settings.isolated({ "compaction.enabled": false });
  */
-
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -29,6 +28,7 @@ import { type Settings as SettingsCapabilityItem, settingsCapability } from "../
 import type { ModelRole } from "../config/model-registry";
 import { loadCapability } from "../discovery";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
+import type { NotificationSettingsReader, NotificationSettingsSnapshot } from "../notifications/config";
 import { AgentStorage } from "../session/agent-storage";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
 import { withFileLock } from "./file-lock";
@@ -70,6 +70,24 @@ export interface SettingsOptions {
 	inMemory?: boolean;
 	/** Initial overrides */
 	overrides?: Partial<Record<SettingPath, unknown>>;
+}
+
+/** Additional layer setup for {@link Settings.isolated}. */
+export interface IsolatedSettingsOptions {
+	/** Initial runtime overrides. Notification paths are rejected. */
+	overrides?: Partial<Record<SettingPath, unknown>>;
+}
+
+/** Raised when an ephemeral override attempts to change global-only notification settings. */
+export class NotificationSettingsOverrideError extends Error {
+	constructor(readonly path: SettingPath) {
+		super(`Runtime overrides are not allowed for global notification setting ${path}.`);
+		this.name = "NotificationSettingsOverrideError";
+	}
+}
+
+function isNotificationSettingsPath(path: string): boolean {
+	return path === "notifications" || path.startsWith("notifications.");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -198,7 +216,7 @@ function resolvePathScopedStringArray(settingPath: SettingPath, value: unknown, 
 // Settings Class
 // ═══════════════════════════════════════════════════════════════════════════
 
-export class Settings {
+export class Settings implements NotificationSettingsReader {
 	#configPath: string | null;
 	#cwd: string;
 	#agentDir: string;
@@ -233,6 +251,7 @@ export class Settings {
 
 		if (options.overrides) {
 			for (const [key, value] of Object.entries(options.overrides)) {
+				if (isNotificationSettingsPath(key)) throw new NotificationSettingsOverrideError(key as SettingPath);
 				setByPath(this.#overrides, key.split("."), value);
 			}
 		}
@@ -267,11 +286,17 @@ export class Settings {
 	}
 
 	/**
-	 * Create an isolated instance for testing.
+	 * Create an isolated instance for testing with explicit user/global settings.
 	 * Does not affect the global singleton.
 	 */
-	static isolated(overrides: Partial<Record<SettingPath, unknown>> = {}): Settings {
-		const instance = new Settings({ inMemory: true, overrides });
+	static isolated(
+		globalSettings: Partial<Record<SettingPath, unknown>> = {},
+		options: IsolatedSettingsOptions = {},
+	): Settings {
+		const instance = new Settings({ inMemory: true, overrides: options.overrides });
+		for (const [key, value] of Object.entries(globalSettings)) {
+			setByPath(instance.#global, key.split("."), value);
+		}
 		instance.#rebuildMerged();
 		return instance;
 	}
@@ -316,6 +341,84 @@ export class Settings {
 		return value === undefined ? undefined : (value as SettingValue<P>);
 	}
 
+	/**
+	 * Read the remote-notification settings from the user/global layer only.
+	 * Schema defaults are applied per path; project settings and runtime overrides
+	 * are deliberately excluded from this trust boundary.
+	 */
+	getNotificationSettingsSnapshot(): NotificationSettingsSnapshot {
+		const enabled = this.#getGlobalResolved("notifications.enabled");
+		const botToken = this.#getGlobalResolved("notifications.telegram.botToken");
+		const chatId = this.#getGlobalResolved("notifications.telegram.chatId");
+		const richEnabled = this.#getGlobalResolved("notifications.telegram.rich.enabled");
+		const richDraftEnabled = this.#getGlobalResolved("notifications.telegram.richDraft.enabled");
+		const nameTemplate = this.#getGlobalResolved("notifications.telegram.topics.nameTemplate");
+		const discordBotToken = this.#getGlobalResolved("notifications.discord.botToken");
+		const discordChannelId = this.#getGlobalResolved("notifications.discord.channelId");
+		const slackBotToken = this.#getGlobalResolved("notifications.slack.botToken");
+		const slackChannelId = this.#getGlobalResolved("notifications.slack.channelId");
+		const redact = this.#getGlobalResolved("notifications.redact");
+		const verbosity = this.#getGlobalResolved("notifications.verbosity");
+		const sessionScope = this.#getGlobalResolved("notifications.sessionScope");
+		const idleTimeoutMs = this.#getGlobalResolved("notifications.daemon.idleTimeoutMs");
+
+		return {
+			enabled: typeof enabled === "boolean" ? enabled : getDefault("notifications.enabled"),
+			telegram: {
+				botToken:
+					typeof botToken === "string" && botToken.length > 0
+						? botToken
+						: getDefault("notifications.telegram.botToken"),
+				chatId:
+					typeof chatId === "string" && chatId.length > 0 ? chatId : getDefault("notifications.telegram.chatId"),
+				rich: {
+					enabled:
+						typeof richEnabled === "boolean" ? richEnabled : getDefault("notifications.telegram.rich.enabled"),
+				},
+				richDraft: {
+					enabled:
+						typeof richDraftEnabled === "boolean"
+							? richDraftEnabled
+							: getDefault("notifications.telegram.richDraft.enabled"),
+				},
+				topics: {
+					nameTemplate:
+						typeof nameTemplate === "string" && nameTemplate.length > 0
+							? nameTemplate
+							: getDefault("notifications.telegram.topics.nameTemplate"),
+				},
+			},
+			discord: {
+				botToken:
+					typeof discordBotToken === "string" && discordBotToken.length > 0
+						? discordBotToken
+						: getDefault("notifications.discord.botToken"),
+				channelId:
+					typeof discordChannelId === "string" && discordChannelId.length > 0
+						? discordChannelId
+						: getDefault("notifications.discord.channelId"),
+			},
+			slack: {
+				botToken:
+					typeof slackBotToken === "string" && slackBotToken.length > 0
+						? slackBotToken
+						: getDefault("notifications.slack.botToken"),
+				channelId:
+					typeof slackChannelId === "string" && slackChannelId.length > 0
+						? slackChannelId
+						: getDefault("notifications.slack.channelId"),
+			},
+			redact: typeof redact === "boolean" ? redact : getDefault("notifications.redact"),
+			verbosity: verbosity === "verbose" || getDefault("notifications.verbosity") === "verbose" ? "verbose" : "lean",
+			sessionScope:
+				sessionScope === "primary" || getDefault("notifications.sessionScope") === "primary" ? "primary" : "all",
+			idleTimeoutMs:
+				typeof idleTimeoutMs === "number" && Number.isFinite(idleTimeoutMs) && idleTimeoutMs > 0
+					? idleTimeoutMs
+					: getDefault("notifications.daemon.idleTimeoutMs"),
+		};
+	}
+
 	/** Check whether a setting is present in loaded settings/overrides rather than coming from schema defaults. */
 	has(path: SettingPath): boolean {
 		return getByPath(this.#merged, path.split(".")) !== undefined;
@@ -349,6 +452,7 @@ export class Settings {
 	 * Apply runtime overrides (not persisted).
 	 */
 	override<P extends SettingPath>(path: P, value: SettingValue<P>): void {
+		if (isNotificationSettingsPath(path)) throw new NotificationSettingsOverrideError(path);
 		const segments = path.split(".");
 		setByPath(this.#overrides, segments, value);
 		this.#rebuildMerged();
@@ -644,9 +748,14 @@ export class Settings {
 			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd });
 			let merged: RawSettings = {};
 			for (const item of result.items as SettingsCapabilityItem[]) {
-				if (item.level === "project") {
-					merged = this.#deepMerge(merged, item.data as RawSettings);
+				if (item.level !== "project") continue;
+				const { settings, rejectedNotifications } = this.#stripProjectNotificationSettings(
+					item.data as RawSettings,
+				);
+				if (rejectedNotifications) {
+					logger.warn("Settings: ignoring project notification settings", { path: item.path });
 				}
+				merged = this.#deepMerge(merged, settings);
 			}
 			return this.#migrateRawSettings(merged);
 		} catch {
@@ -942,6 +1051,27 @@ export class Settings {
 				hook(value, value);
 			}
 		}
+	}
+
+	#getGlobalResolved<P extends SettingPath>(path: P): SettingValue<P> {
+		const value = getByPath(this.#global, path.split("."));
+		return value === undefined ? getDefault(path) : (value as SettingValue<P>);
+	}
+
+	#stripProjectNotificationSettings(settings: RawSettings): {
+		settings: RawSettings;
+		rejectedNotifications: boolean;
+	} {
+		let rejectedNotifications = false;
+		const sanitized: RawSettings = {};
+		for (const [key, value] of Object.entries(settings)) {
+			if (isNotificationSettingsPath(key)) {
+				rejectedNotifications = true;
+				continue;
+			}
+			sanitized[key] = value;
+		}
+		return { settings: sanitized, rejectedNotifications };
 	}
 
 	#deepMerge(base: RawSettings, overrides: RawSettings): RawSettings {

@@ -1,5 +1,4 @@
 import * as crypto from "node:crypto";
-import type { Settings } from "../config/settings";
 
 /**
  * Env marker set by GJC's own programmatic separate-process child spawn sites
@@ -11,6 +10,45 @@ import type { Settings } from "../config/settings";
  * site marks it, never by inheriting a marked ancestor's environment.
  */
 export const SPAWN_PROVENANCE_ENV = "GJC_SPAWNED_BY_SESSION";
+
+export interface NotificationSettingsSnapshot {
+	enabled: boolean;
+	telegram: {
+		botToken?: string;
+		chatId?: string;
+		rich: {
+			enabled: boolean;
+		};
+		richDraft: {
+			enabled: boolean;
+		};
+		topics: {
+			nameTemplate?: string;
+		};
+	};
+	discord: {
+		botToken?: string;
+		channelId?: string;
+	};
+	slack: {
+		botToken?: string;
+		channelId?: string;
+	};
+	redact: boolean;
+	verbosity: "lean" | "verbose";
+	sessionScope: "all" | "primary";
+	idleTimeoutMs: number;
+}
+
+/**
+ * Narrow settings boundary for remote notification identity and behavior.
+ * Implementations must return only user-global values, with schema defaults
+ * applied; project settings and runtime overrides are intentionally excluded.
+ */
+export interface NotificationSettingsReader {
+	getNotificationSettingsSnapshot(): NotificationSettingsSnapshot;
+	getAgentDir(): string;
+}
 
 export interface NotificationConfig {
 	enabled: boolean;
@@ -50,33 +88,22 @@ export interface NotificationConfig {
 	};
 }
 
-/** Read typed config from Settings. */
-export function getNotificationConfig(settings: Settings): NotificationConfig {
+/** Read typed global-only notification config from a narrow settings reader. */
+export function getNotificationConfig(settings: NotificationSettingsReader): NotificationConfig {
+	const snapshot = settings.getNotificationSettingsSnapshot();
 	return {
-		enabled: settings.get("notifications.enabled"),
-		botToken: settings.get("notifications.telegram.botToken"),
-		chatId: settings.get("notifications.telegram.chatId"),
-		discord: {
-			botToken: settings.get("notifications.discord.botToken"),
-			channelId: settings.get("notifications.discord.channelId"),
-		},
-		slack: {
-			botToken: settings.get("notifications.slack.botToken"),
-			channelId: settings.get("notifications.slack.channelId"),
-		},
-		redact: settings.get("notifications.redact"),
-		verbosity: settings.get("notifications.verbosity") === "verbose" ? "verbose" : "lean",
-		sessionScope: settings.get("notifications.sessionScope") === "primary" ? "primary" : "all",
-		idleTimeoutMs: settings.get("notifications.daemon.idleTimeoutMs"),
-		rich: {
-			enabled: settings.get("notifications.telegram.rich.enabled"),
-		},
-		richDraft: {
-			enabled: settings.get("notifications.telegram.richDraft.enabled"),
-		},
-		topics: {
-			nameTemplate: settings.get("notifications.telegram.topics.nameTemplate"),
-		},
+		enabled: snapshot.enabled,
+		botToken: snapshot.telegram.botToken,
+		chatId: snapshot.telegram.chatId,
+		discord: snapshot.discord,
+		slack: snapshot.slack,
+		redact: snapshot.redact,
+		verbosity: snapshot.verbosity,
+		sessionScope: snapshot.sessionScope,
+		idleTimeoutMs: snapshot.idleTimeoutMs,
+		rich: snapshot.telegram.rich,
+		richDraft: snapshot.telegram.richDraft,
+		topics: snapshot.telegram.topics,
 	};
 }
 

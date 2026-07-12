@@ -3,7 +3,12 @@ import * as path from "node:path";
 import { YAML } from "bun";
 import { withFileLock } from "../config/file-lock";
 import type { Settings } from "../config/settings";
-import { getNotificationConfig, isTelegramConfigured } from "./config";
+import {
+	getNotificationConfig,
+	isTelegramConfigured,
+	type NotificationSettingsReader,
+	type NotificationSettingsSnapshot,
+} from "./config";
 import { daemonPaths } from "./daemon-paths";
 import type { TelegramDaemonOptions } from "./telegram-daemon";
 
@@ -14,9 +19,12 @@ type TelegramDaemonRunner = {
 
 type TelegramDaemonConstructor = new (opts: TelegramDaemonOptions) => TelegramDaemonRunner;
 
+export type LightweightDaemonSettings = Pick<Settings, "get" | "getAgentDir" | "set" | "flush"> &
+	NotificationSettingsReader;
+
 export interface RunDaemonInternalDeps {
 	SettingsImpl?: {
-		init: (options?: { agentDir?: string }) => Promise<Pick<Settings, "get" | "getAgentDir" | "set" | "flush">>;
+		init: (options?: { agentDir?: string }) => Promise<LightweightDaemonSettings>;
 	};
 	DaemonImpl?: TelegramDaemonConstructor;
 	processPid?: number;
@@ -63,36 +71,74 @@ function asIdleTimeoutMs(value: unknown): number {
 export function createLightweightDaemonSettings(input: {
 	agentDir: string;
 	rawConfig?: unknown;
-}): Pick<Settings, "get" | "getAgentDir" | "set" | "flush"> {
+}): LightweightDaemonSettings {
 	const rawConfig = input.rawConfig && typeof input.rawConfig === "object" ? input.rawConfig : {};
+	const getNotificationSettingsSnapshot = (): NotificationSettingsSnapshot => ({
+		enabled: asBoolean(getByPath(rawConfig, ["notifications", "enabled"]), false),
+		telegram: {
+			botToken: asString(getByPath(rawConfig, ["notifications", "telegram", "botToken"])),
+			chatId: asString(getByPath(rawConfig, ["notifications", "telegram", "chatId"])),
+			rich: {
+				enabled: asBoolean(getByPath(rawConfig, ["notifications", "telegram", "rich", "enabled"]), true),
+			},
+			richDraft: {
+				enabled: asBoolean(getByPath(rawConfig, ["notifications", "telegram", "richDraft", "enabled"]), false),
+			},
+			topics: {
+				nameTemplate: asString(getByPath(rawConfig, ["notifications", "telegram", "topics", "nameTemplate"])),
+			},
+		},
+		discord: {
+			botToken: asString(getByPath(rawConfig, ["notifications", "discord", "botToken"])),
+			channelId: asString(getByPath(rawConfig, ["notifications", "discord", "channelId"])),
+		},
+		slack: {
+			botToken: asString(getByPath(rawConfig, ["notifications", "slack", "botToken"])),
+			channelId: asString(getByPath(rawConfig, ["notifications", "slack", "channelId"])),
+		},
+		redact: asBoolean(getByPath(rawConfig, ["notifications", "redact"]), false),
+		verbosity: getByPath(rawConfig, ["notifications", "verbosity"]) === "verbose" ? "verbose" : "lean",
+		sessionScope: getByPath(rawConfig, ["notifications", "sessionScope"]) === "primary" ? "primary" : "all",
+		idleTimeoutMs: asIdleTimeoutMs(getByPath(rawConfig, ["notifications", "daemon", "idleTimeoutMs"])),
+	});
+
 	return {
 		get(pathName: string): unknown {
-			const value = getByPath(rawConfig, pathName.split("."));
+			const snapshot = getNotificationSettingsSnapshot();
 			switch (pathName) {
 				case "notifications.enabled":
-					return asBoolean(value, false);
+					return snapshot.enabled;
 				case "notifications.telegram.botToken":
+					return snapshot.telegram.botToken;
 				case "notifications.telegram.chatId":
-				case "notifications.discord.botToken":
-				case "notifications.discord.channelId":
-				case "notifications.slack.botToken":
-				case "notifications.slack.channelId":
-				case "notifications.telegram.topics.nameTemplate":
-					return asString(value);
+					return snapshot.telegram.chatId;
 				case "notifications.telegram.rich.enabled":
-					return asBoolean(value, true);
+					return snapshot.telegram.rich.enabled;
 				case "notifications.telegram.richDraft.enabled":
-					return asBoolean(value, false);
+					return snapshot.telegram.richDraft.enabled;
+				case "notifications.telegram.topics.nameTemplate":
+					return snapshot.telegram.topics.nameTemplate;
+				case "notifications.discord.botToken":
+					return snapshot.discord.botToken;
+				case "notifications.discord.channelId":
+					return snapshot.discord.channelId;
+				case "notifications.slack.botToken":
+					return snapshot.slack.botToken;
+				case "notifications.slack.channelId":
+					return snapshot.slack.channelId;
 				case "notifications.redact":
-					return asBoolean(value, false);
+					return snapshot.redact;
 				case "notifications.verbosity":
-					return value === "verbose" ? "verbose" : "lean";
+					return snapshot.verbosity;
+				case "notifications.sessionScope":
+					return snapshot.sessionScope;
 				case "notifications.daemon.idleTimeoutMs":
-					return asIdleTimeoutMs(value);
+					return snapshot.idleTimeoutMs;
 				default:
 					return undefined;
 			}
 		},
+		getNotificationSettingsSnapshot,
 		getAgentDir(): string {
 			return input.agentDir;
 		},
@@ -129,12 +175,10 @@ export function createLightweightDaemonSettings(input: {
 			// flush. Present so the daemon can await flush() uniformly regardless of
 			// which Settings implementation is injected.
 		},
-	} as Pick<Settings, "get" | "getAgentDir" | "set" | "flush">;
+	} as LightweightDaemonSettings;
 }
 
-export async function loadLightweightDaemonSettings(
-	agentDir: string,
-): Promise<Pick<Settings, "get" | "getAgentDir" | "set" | "flush">> {
+export async function loadLightweightDaemonSettings(agentDir: string): Promise<LightweightDaemonSettings> {
 	const configPath = path.join(agentDir, "config.yml");
 	let rawConfig: unknown = {};
 	try {
@@ -148,7 +192,7 @@ export async function loadLightweightDaemonSettings(
 async function resolveDaemonSettings(
 	agentDir: string,
 	deps: RunDaemonInternalDeps,
-): Promise<Pick<Settings, "get" | "getAgentDir" | "set" | "flush">> {
+): Promise<LightweightDaemonSettings> {
 	if (deps.SettingsImpl) return await deps.SettingsImpl.init({ agentDir });
 	return await loadLightweightDaemonSettings(agentDir);
 }
@@ -199,7 +243,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	}
 	const resolvedAgentDir = agentDir ?? process.env.GJC_CODING_AGENT_DIR ?? path.join(process.cwd(), ".gjc", "agent");
 	const settings = await resolveDaemonSettings(resolvedAgentDir, deps);
-	const cfg = getNotificationConfig(settings as Settings);
+	const cfg = getNotificationConfig(settings);
 	if (!isTelegramConfigured(cfg)) return;
 	const { clearTelegramControlRequest, readTelegramControlRequest } = await import("./telegram-daemon-control");
 	const Daemon: TelegramDaemonConstructor =

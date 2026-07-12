@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { YAML } from "bun";
-import { withFileLock } from "../config/file-lock";
+import { applyAtomicYamlPatches, setByPath } from "../config/atomic-yaml-patch";
 import type { Settings } from "../config/settings";
 import {
 	getNotificationConfig,
@@ -43,17 +43,6 @@ function getByPath(obj: unknown, pathSegments: string[]): unknown {
 		current = (current as Record<string, unknown>)[segment];
 	}
 	return current;
-}
-
-function setByPath(obj: Record<string, unknown>, pathSegments: string[], value: unknown): void {
-	let current = obj;
-	for (let i = 0; i < pathSegments.length - 1; i++) {
-		const segment = pathSegments[i]!;
-		const next = current[segment];
-		if (!next || typeof next !== "object" || Array.isArray(next)) current[segment] = {};
-		current = current[segment] as Record<string, unknown>;
-	}
-	current[pathSegments[pathSegments.length - 1]!] = value;
 }
 
 function asString(value: unknown): string | undefined {
@@ -143,31 +132,12 @@ export function createLightweightDaemonSettings(input: {
 			return input.agentDir;
 		},
 		async set(pathName: string, value: unknown): Promise<void> {
-			// Back onto config.yml directly (the full Settings class is not loaded in
-			// the spawned daemon process). Contend on the SAME per-file lock as
-			// Settings.#saveNow and re-read UNDER the lock, patching only this key, so
-			// a concurrent main-process save can never drop unrelated settings (no
-			// whole-file last-writer-wins). The write is atomic (tmp + rename) so a
-			// crash mid-write can never truncate config.yml, and any failure propagates
-			// so the `/rich` handler leaves runtime state unchanged. The in-memory view
-			// is updated only after the durable write succeeds.
-			const segments = pathName.split(".");
+			// The daemon process never loads full Settings, but writes through the exact
+			// same in-process queue, cross-process lock, and atomic replacement helper.
+			// Its local snapshot changes only after the durable rename succeeds.
 			const configPath = path.join(input.agentDir, "config.yml");
-			await withFileLock(configPath, async () => {
-				let onDisk: Record<string, unknown> = {};
-				try {
-					const parsed = YAML.parse(await fs.promises.readFile(configPath, "utf8"));
-					if (parsed && typeof parsed === "object") onDisk = parsed as Record<string, unknown>;
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				}
-				setByPath(onDisk, segments, value);
-				await fs.promises.mkdir(path.dirname(configPath), { recursive: true });
-				const tmpPath = `${configPath}.tmp.${process.pid}.${Date.now()}`;
-				await fs.promises.writeFile(tmpPath, YAML.stringify(onDisk), { mode: 0o600 });
-				await fs.promises.rename(tmpPath, configPath);
-			});
-			setByPath(rawConfig as Record<string, unknown>, segments, value);
+			await applyAtomicYamlPatches(configPath, [{ path: pathName, op: "set", value }]);
+			setByPath(rawConfig as Record<string, unknown>, pathName.split("."), value);
 		},
 		async flush(): Promise<void> {
 			// The set() above is synchronously durable (it awaits the atomic tmp+rename

@@ -31,7 +31,14 @@ import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset }
 import type { NotificationSettingsReader, NotificationSettingsSnapshot } from "../notifications/config";
 import { AgentStorage } from "../session/agent-storage";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
-import { withFileLock } from "./file-lock";
+import {
+	type AtomicYamlPatch,
+	applyAtomicYamlPatches,
+	type CasReceipt,
+	deleteByPath,
+	reserveAtomicYamlPatchSlot,
+	setByPath,
+} from "./atomic-yaml-patch";
 import {
 	type BashInterceptorRule,
 	type GroupPrefix,
@@ -55,12 +62,24 @@ export interface RawSettings {
 	[key: string]: unknown;
 }
 
-type SettingsPatch = {
-	readonly path: string;
-	readonly value: unknown;
-	readonly generation: number;
+type StagedMutation = {
+	revision: number;
+	patch: AtomicYamlPatch;
 };
 
+type PendingSaveSlot = {
+	captured: boolean;
+	released: boolean;
+	release: () => void;
+	wait: Promise<void>;
+};
+type DurableBatchRevision = {
+	patch: AtomicYamlPatch;
+	previousRevision: number | undefined;
+	revision: number;
+};
+
+export type SettingsAtomicPatch = { path: SettingPath; op: "set"; value: unknown } | { path: SettingPath; op: "unset" };
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
 	cwd?: string;
@@ -106,22 +125,6 @@ function getByPath(obj: RawSettings, segments: string[]): unknown {
 		current = (current as Record<string, unknown>)[segment];
 	}
 	return current;
-}
-
-/**
- * Set a nested value in an object by path segments.
- * Creates intermediate objects as needed.
- */
-function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
-	let current = obj;
-	for (let i = 0; i < segments.length - 1; i++) {
-		const segment = segments[i];
-		if (!(segment in current) || typeof current[segment] !== "object" || current[segment] === null) {
-			current[segment] = {};
-		}
-		current = current[segment] as RawSettings;
-	}
-	current[segments[segments.length - 1]] = value;
 }
 
 const PATH_SCOPED_ARRAY_SETTINGS = new Set<SettingPath>(["enabledModels", "disabledProviders"]);
@@ -231,13 +234,15 @@ export class Settings implements NotificationSettingsReader {
 	/** Merged view (global + project + overrides) */
 	#merged: RawSettings = {};
 
-	/** Latest dirty patch for each path, owned by its generation. */
-	#modified = new Map<string, SettingsPatch>();
-	#nextGeneration = 0;
+	/** Paths modified during this session, with their staged persistence revisions. */
+	#modified = new Map<string, StagedMutation>();
+	#pathRevisions = new Map<string, number>();
+	#nextRevision = 0;
 
-	/** Pending save (debounced) */
+	/** Pending debounced ordinary save; its queue slot is reserved immediately. */
 	#saveTimer?: NodeJS.Timeout;
-	#saveTail: Promise<void> = Promise.resolve();
+	#savePromise?: Promise<void>;
+	#pendingSaveSlot?: PendingSaveSlot;
 	#globalModelRoleTail: Promise<void> = Promise.resolve();
 
 	/** Whether to persist changes */
@@ -426,25 +431,79 @@ export class Settings implements NotificationSettingsReader {
 
 	/**
 	 * Set a setting value (sync).
-	 * Updates global settings and queues a background save.
-	 * Triggers hooks for settings that have side effects.
+	 * Updates global settings and reserves its background persistence slot before
+	 * returning, so later durable batches cannot overtake this mutation.
 	 */
-	set<P extends SettingPath>(path: P, value: SettingValue<P>): void {
-		const prev = this.get(path);
-		const patch: SettingsPatch = {
-			path,
-			value: structuredClone(value),
-			generation: ++this.#nextGeneration,
-		};
-		setByPath(this.#global, path.split("."), structuredClone(patch.value));
-		this.#modified.set(path, patch);
-		this.#rebuildMerged();
-		this.#queueSave();
+	set<P extends SettingPath>(path: P, value: SettingValue<P> | undefined): void {
+		if (value === undefined) {
+			this.unset(path);
+			return;
+		}
 
-		// Trigger hook if exists
+		const prev = this.get(path);
+		setByPath(this.#global, path.split("."), value);
+		this.#stageMutation(path, { path, op: "set", value: structuredClone(value) });
+		this.#rebuildMerged();
+
 		const hook = SETTING_HOOKS[path];
-		if (hook) {
-			hook(value, prev);
+		if (hook) hook(value, prev);
+	}
+
+	/**
+	 * Delete a global setting (sync), rather than serializing an ambiguous YAML
+	 * `undefined` value. Defaults/project settings become visible immediately.
+	 */
+	unset<P extends SettingPath>(path: P): void {
+		const prev = this.get(path);
+		deleteByPath(this.#global, path.split("."));
+		this.#stageMutation(path, { path, op: "unset" });
+		this.#rebuildMerged();
+
+		const hook = SETTING_HOOKS[path];
+		if (hook) hook(this.get(path), prev);
+	}
+
+	/**
+	 * Persist a tagged batch as one atomic YAML replacement. Unlike ordinary
+	 * {@link set}, canonical state and hooks change only after the rename succeeds.
+	 */
+	async commitAtomicBatch(patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> {
+		for (const patch of patches) {
+			if (patch.op === "set" && patch.value === undefined) {
+				throw new TypeError(`Settings set patch for ${patch.path} cannot carry undefined; use unset instead.`);
+			}
+		}
+		if (!this.#persist || !this.#configPath) {
+			throw new Error("commitAtomicBatch requires persistent Settings with a config.yml path.");
+		}
+
+		// A durable batch is a causal barrier: close the earlier ordinary debounce
+		// inside its already-reserved slot before queueing this batch.
+		this.#releasePendingSaveSlot();
+
+		const revisions = patches.map(patch => ({
+			patch: patch as AtomicYamlPatch,
+			revision: ++this.#nextRevision,
+			previousRevision: this.#pathRevisions.get(patch.path),
+		}));
+		for (const entry of revisions) this.#pathRevisions.set(entry.patch.path, entry.revision);
+
+		try {
+			const receipt = await applyAtomicYamlPatches(
+				this.#configPath,
+				revisions.map(entry => entry.patch),
+			);
+			this.#applyDurableBatch(revisions);
+			return receipt;
+		} catch (error) {
+			for (const entry of revisions) {
+				if (this.#pathRevisions.get(entry.patch.path) === entry.revision) {
+					if (entry.previousRevision === undefined) this.#pathRevisions.delete(entry.patch.path);
+					else this.#pathRevisions.set(entry.patch.path, entry.previousRevision);
+				}
+			}
+			if (this.#modified.size > 0 && !this.#pendingSaveSlot) this.#queueSave();
+			throw error;
 		}
 	}
 
@@ -473,32 +532,22 @@ export class Settings implements NotificationSettingsReader {
 		this.#rebuildMerged();
 	}
 
-	/**
-	 * Flush any pending saves to disk.
-	 * Call before exit to ensure all changes are persisted.
-	 */
+	/** Flush a reserved debounced save without allowing it to be overtaken. */
 	async flush(): Promise<void> {
-		if (this.#saveTimer) {
-			clearTimeout(this.#saveTimer);
-			this.#saveTimer = undefined;
+		this.#releasePendingSaveSlot();
+		const pending = this.#savePromise;
+		if (!pending) return;
+		try {
+			await pending;
+		} catch {
+			// Historical flush() behavior logs background failures but does not reject.
 		}
-		const save = this.#modified.size > 0 ? this.#saveNow() : this.#saveTail;
-		await save;
 	}
 
-	/**
-	 * Like {@link flush}, but rejects if the durable save fails instead of
-	 * swallowing the error. Use where the caller must confirm persistence before
-	 * reporting success (e.g. the Telegram `/rich` toggle). In-memory instances
-	 * ({@link isolated}) short-circuit in {@link #saveNow} and never throw.
-	 */
+	/** Like {@link flush}, but reports a durable save failure to the caller. */
 	async flushOrThrow(): Promise<void> {
-		if (this.#saveTimer) {
-			clearTimeout(this.#saveTimer);
-			this.#saveTimer = undefined;
-		}
-		const save = this.#modified.size > 0 ? this.#saveNow({ throwOnError: true }) : this.#saveTail;
-		await save;
+		this.#releasePendingSaveSlot();
+		await this.#savePromise;
 	}
 
 	async cloneForCwd(cwd: string): Promise<Settings> {
@@ -616,23 +665,23 @@ export class Settings implements NotificationSettingsReader {
 		const transaction = this.#globalModelRoleTail.then(async () => {
 			const hadModelRoles = Object.hasOwn(this.#global, "modelRoles");
 			const previousModelRoles = structuredClone(this.#global.modelRoles);
-			const previousPatch = this.#modified.get("modelRoles");
+			const previousStaged = this.#modified.get("modelRoles");
+			const previousRevision = this.#pathRevisions.get("modelRoles");
 			this.setGlobalModelRole(role, modelId);
-			const generation = this.#modified.get("modelRoles")?.generation;
-			if (this.#saveTimer) {
-				clearTimeout(this.#saveTimer);
-				this.#saveTimer = undefined;
-			}
-			const save = this.#saveNow({ throwOnError: true });
+			const revision = this.#modified.get("modelRoles")?.revision;
 			try {
-				await save;
+				await this.flushOrThrow();
 			} catch (error) {
-				const currentPatch = this.#modified.get("modelRoles");
-				if (currentPatch?.generation === generation) {
+				// Roll back the durable default selection only when no newer
+				// modelRoles write has superseded this attempt (revision unchanged).
+				const currentRevision = this.#modified.get("modelRoles")?.revision ?? this.#pathRevisions.get("modelRoles");
+				if (currentRevision === revision) {
 					if (hadModelRoles) this.#global.modelRoles = previousModelRoles;
 					else delete this.#global.modelRoles;
-					if (previousPatch) this.#modified.set("modelRoles", previousPatch);
+					if (previousStaged) this.#modified.set("modelRoles", previousStaged);
 					else this.#modified.delete("modelRoles");
+					if (previousRevision === undefined) this.#pathRevisions.delete("modelRoles");
+					else this.#pathRevisions.set("modelRoles", previousRevision);
 					this.#rebuildMerged();
 				}
 				throw error;
@@ -799,10 +848,17 @@ export class Settings implements NotificationSettingsReader {
 			}
 		} catch {}
 
-		// 3. Write merged settings
+		// 3. Write merged settings through the shared atomic YAML pipeline.
 		if (migrated && Object.keys(settings).length > 0) {
 			try {
-				await Bun.write(this.#configPath, YAML.stringify(settings, null, 2));
+				await applyAtomicYamlPatches(
+					this.#configPath,
+					Object.entries(settings).map(([settingPath, value]) => ({
+						path: settingPath,
+						op: "set" as const,
+						value,
+					})),
+				);
 				logger.debug("Settings: migrated to config.yml", { path: this.#configPath });
 			} catch {}
 		}
@@ -976,62 +1032,103 @@ export class Settings implements NotificationSettingsReader {
 	// Saving
 	// ─────────────────────────────────────────────────────────────────────────
 
+	#stageMutation(path: SettingPath, patch: AtomicYamlPatch): void {
+		const revision = ++this.#nextRevision;
+		this.#pathRevisions.set(path, revision);
+		this.#modified.set(path, { revision, patch });
+		this.#queueSave();
+	}
+
 	#queueSave(): void {
 		if (!this.#persist || !this.#configPath) return;
 
+		const currentSlot = this.#pendingSaveSlot;
+		if (currentSlot && !currentSlot.captured && !currentSlot.released) {
+			this.#armSaveTimer(currentSlot);
+			return;
+		}
+
+		let release!: () => void;
+		const slot: PendingSaveSlot = {
+			captured: false,
+			released: false,
+			release: () => release(),
+			wait: new Promise<void>(resolve => {
+				release = resolve;
+			}),
+		};
+		this.#pendingSaveSlot = slot;
+
+		let captured: StagedMutation[] = [];
+		const save = reserveAtomicYamlPatchSlot(this.#configPath, async () => {
+			await slot.wait;
+			slot.captured = true;
+			if (this.#pendingSaveSlot === slot) this.#pendingSaveSlot = undefined;
+			captured = [...this.#modified.values()];
+			return captured.map(entry => entry.patch);
+		}).then(() => {
+			for (const entry of captured) {
+				const current = this.#modified.get(entry.patch.path);
+				if (current?.revision === entry.revision && this.#pathRevisions.get(entry.patch.path) === entry.revision) {
+					this.#modified.delete(entry.patch.path);
+				}
+			}
+		});
+		this.#savePromise = save;
+		void save.catch(error => {
+			logger.warn("Settings: background save failed", { error: String(error) });
+			if (this.#modified.size > 0 && !this.#pendingSaveSlot) this.#queueSave();
+		});
+		this.#armSaveTimer(slot);
+	}
+
+	#armSaveTimer(slot: PendingSaveSlot): void {
 		if (this.#saveTimer) clearTimeout(this.#saveTimer);
 		this.#saveTimer = setTimeout(() => {
 			this.#saveTimer = undefined;
-			void this.#saveNow();
+			if (slot.released) return;
+			slot.released = true;
+			slot.release();
 		}, 100);
 	}
 
-	async #saveNow(options: { throwOnError?: boolean } = {}): Promise<void> {
-		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
-
-		const configPath = this.#configPath;
-		const patches = [...this.#modified.values()];
-
-		const save = this.#saveTail.then(() =>
-			withFileLock(configPath, async () => {
-				const current = await this.#loadYaml(configPath);
-				for (const patch of patches) {
-					setByPath(current, patch.path.split("."), patch.value);
-				}
-				await Bun.write(configPath, YAML.stringify(current, null, 2));
-				for (const patch of patches) {
-					if (this.#modified.get(patch.path)?.generation === patch.generation) {
-						this.#modified.delete(patch.path);
-					}
-				}
-				this.#global = current;
-				for (const patch of this.#modified.values()) {
-					setByPath(this.#global, patch.path.split("."), structuredClone(patch.value));
-				}
-			}),
-		);
-		this.#saveTail = save.then(
-			() => undefined,
-			() => undefined,
-		);
-
-		try {
-			await save;
-		} catch (error) {
-			logger.warn("Settings: save failed", { error: String(error) });
-			for (const patch of patches) {
-				const currentPatch = this.#modified.get(patch.path);
-				if (currentPatch?.generation === patch.generation) {
-					this.#modified.set(patch.path, patch);
-				}
-			}
-			if (options.throwOnError) {
-				this.#rebuildMerged();
-				throw error;
-			}
+	#releasePendingSaveSlot(): void {
+		if (this.#saveTimer) {
+			clearTimeout(this.#saveTimer);
+			this.#saveTimer = undefined;
 		}
+		const slot = this.#pendingSaveSlot;
+		if (!slot || slot.released) return;
+		slot.released = true;
+		slot.release();
+	}
 
+	#applyDurableBatch(revisions: readonly DurableBatchRevision[]): void {
+		const finalByPath = new Map<string, DurableBatchRevision>();
+		for (const entry of revisions) finalByPath.set(entry.patch.path, entry);
+		const applicable = [...finalByPath.values()].filter(
+			entry => this.#pathRevisions.get(entry.patch.path) === entry.revision,
+		);
+		if (applicable.length === 0) return;
+
+		const previous = new Map<SettingPath, SettingValue<SettingPath>>();
+		for (const entry of applicable) {
+			const settingPath = entry.patch.path as SettingPath;
+			previous.set(settingPath, this.get(settingPath));
+			if (entry.patch.op === "set") {
+				setByPath(this.#global, settingPath.split("."), structuredClone(entry.patch.value));
+			} else {
+				deleteByPath(this.#global, settingPath.split("."));
+			}
+			const staged = this.#modified.get(settingPath);
+			if (staged && staged.revision <= entry.revision) this.#modified.delete(settingPath);
+		}
 		this.#rebuildMerged();
+		for (const entry of applicable) {
+			const settingPath = entry.patch.path as SettingPath;
+			const hook = SETTING_HOOKS[settingPath];
+			if (hook) hook(this.get(settingPath), previous.get(settingPath)!);
+		}
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────

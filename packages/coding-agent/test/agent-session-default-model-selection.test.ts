@@ -99,9 +99,10 @@ describe("AgentSession durable default model selection", () => {
 		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
 		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (...args) => {
 			const apiKey = await originalGetApiKey(...args);
-			preflightComplete.resolve();
+			if (args[0] === model) preflightComplete.resolve();
 			return apiKey;
 		});
+		settings.set("compaction.enabled", false);
 		const prompt = session.prompt("in flight");
 		await streamCreated.promise;
 		const entriesBeforeSelection = sessionManager.getEntries();

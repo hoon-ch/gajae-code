@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import {
 	markdownToTelegramHtml,
@@ -12,6 +13,7 @@ import {
 import { deliverRichWithFallback } from "../src/notifications/rich-render";
 import {
 	acquireDaemonOwnership,
+	type BotApi,
 	DAEMON_GENERATION,
 	DAEMON_VERSION,
 	daemonPaths,
@@ -3555,6 +3557,82 @@ test("inbound photo is downloaded and forwarded as an image in the user_message"
 	expect(Buffer.from(frame.images[0].data, "base64")).toEqual(Buffer.from([1, 2, 3, 4]));
 	// The largest photo size is the one resolved/downloaded.
 	expect(bot.calls.some(c => c.method === "getFile" && c.body.file_id === "large")).toBe(true);
+});
+
+test("redacts token-shaped download URLs from attachment failure logs", async () => {
+	const botToken = "123456789:ABCDEF_ghijklmnopqrstuvwxyz012345";
+	let downloadedUrl = "";
+	const fetchImpl = (async (url: string | URL | Request) => {
+		downloadedUrl = String(url);
+		throw new Error(`fetch failed: ${downloadedUrl}`);
+	}) as unknown as typeof fetch;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken,
+		chatId: "42",
+		fetchImpl,
+	});
+	const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+
+	try {
+		await expect(
+			(
+				daemon as unknown as { downloadTelegramFile(filePath: string): Promise<Buffer | undefined> }
+			).downloadTelegramFile("photos/file.jpg"),
+		).resolves.toBeUndefined();
+
+		const logged = JSON.stringify([...warnSpy.mock.calls, ...errorSpy.mock.calls]);
+		expect(downloadedUrl).toBe(`https://api.telegram.org/file/bot${botToken}/photos/file.jpg`);
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+		expect(errorSpy).not.toHaveBeenCalled();
+		expect(logged).toContain("<redacted>");
+		expect(logged).not.toContain(botToken);
+		expect(logged).not.toMatch(/\d{6,}:[A-Za-z0-9_-]{20,}/);
+	} finally {
+		warnSpy.mockRestore();
+		errorSpy.mockRestore();
+	}
+});
+
+test("redacts token-shaped URLs from getUpdates poll failure logs", async () => {
+	const botToken = "123456789:ABCDEF_ghijklmnopqrstuvwxyz012345";
+	const botApi: BotApi = {
+		async call(method: string): Promise<unknown> {
+			if (method === "getUpdates") {
+				throw new Error(`fetch failed: https://api.telegram.org/bot${botToken}/getUpdates`);
+			}
+			return { ok: true, result: [] };
+		},
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken,
+		chatId: "42",
+		botApi,
+		setTimeoutImpl: ((callback: () => void) => {
+			callback();
+			return 0;
+		}) as unknown as typeof setTimeout,
+	});
+	const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+
+	try {
+		await expect(daemon.pollOnce()).resolves.toBe(0);
+
+		const logged = JSON.stringify([...warnSpy.mock.calls, ...errorSpy.mock.calls]);
+		expect(warnSpy).not.toHaveBeenCalled();
+		expect(errorSpy).toHaveBeenCalledTimes(1);
+		expect(logged).toContain("<redacted>");
+		expect(logged).not.toContain(botToken);
+		expect(logged).not.toMatch(/\d{6,}:[A-Za-z0-9_-]{20,}/);
+	} finally {
+		warnSpy.mockRestore();
+		errorSpy.mockRestore();
+	}
 });
 
 test("inbound document is saved to a tmp file and its path injected into the text", async () => {

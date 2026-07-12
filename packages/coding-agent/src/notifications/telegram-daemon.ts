@@ -2158,7 +2158,7 @@ export class TelegramNotificationDaemon {
 			if (!res.ok) return undefined;
 			return Buffer.from(await res.arrayBuffer());
 		} catch (e) {
-			logger.warn(`notifications: file download failed: ${String(e)}`);
+			logger.warn(`notifications: file download failed: ${sanitizeDiagnostic(String(e))}`);
 			return undefined;
 		}
 	}
@@ -3292,7 +3292,9 @@ export class TelegramNotificationDaemon {
 					// Back off (bounded, below the heartbeat TTL) and keep renewing
 					// ownership at the loop top.
 					const backoffMs = this.loopBackoff.next();
-					logger.warn(`notifications: getUpdates failed, backing off ${backoffMs}ms: ${String(e)}`);
+					logger.warn(
+						`notifications: getUpdates failed, backing off ${backoffMs}ms: ${sanitizeDiagnostic(String(e))}`,
+					);
 					await this.runtime.sleep(backoffMs);
 					continue;
 				} finally {

@@ -66,6 +66,8 @@ export class NotificationSessionController {
 	readonly #disabledSessions = new Set<string>();
 	/** Sessions held inactive after a post-commit foreign daemon identity race. */
 	readonly #blockedRuntimeSessions = new Set<string>();
+	/** Serializes endpoint mutations for each bound session snapshot. */
+	readonly #sessionOperations = new Map<string, Promise<void>>();
 	#runtime: NotificationSessionRuntime<any> | undefined;
 
 	constructor(options: NotificationSessionControllerOptions) {
@@ -135,9 +137,12 @@ export class NotificationSessionController {
 	async enterBlockedRuntime<Context extends NotificationSessionContext>(context: Context): Promise<boolean> {
 		const binding = this.bind(context);
 		try {
-			this.#blockedRuntimeSessions.add(binding.sessionId);
-			const runtime = this.#runtime as NotificationSessionRuntime<Context> | undefined;
-			return runtime?.isRunning(binding) ? await runtime.stop(binding) : false;
+			return await this.#enqueue(binding, async () => {
+				const runtime = this.#runtime as NotificationSessionRuntime<Context> | undefined;
+				const stopped = runtime?.isRunning(binding) ? await runtime.stop(binding) : false;
+				this.#blockedRuntimeSessions.add(binding.sessionId);
+				return stopped;
+			});
 		} finally {
 			binding.unbind();
 		}
@@ -147,7 +152,9 @@ export class NotificationSessionController {
 	async clearBlockedRuntime<Context extends NotificationSessionContext>(context: Context): Promise<void> {
 		const binding = this.bind(context);
 		try {
-			this.#blockedRuntimeSessions.delete(binding.sessionId);
+			await this.#enqueue(binding, async () => {
+				this.#blockedRuntimeSessions.delete(binding.sessionId);
+			});
 		} finally {
 			binding.unbind();
 		}
@@ -159,12 +166,14 @@ export class NotificationSessionController {
 	): Promise<NotificationSessionReconcileResult> {
 		const binding = this.bind(context);
 		try {
-			if (enabled) this.#disabledSessions.delete(binding.sessionId);
-			else this.#disabledSessions.add(binding.sessionId);
+			return await this.#enqueue(binding, async () => {
+				if (enabled) this.#disabledSessions.delete(binding.sessionId);
+				else this.#disabledSessions.add(binding.sessionId);
+				return await this.#reconcile(binding);
+			});
 		} finally {
 			binding.unbind();
 		}
-		return await this.reconcileCurrentSession(context);
 	}
 
 	async reconcileCurrentSession<Context extends NotificationSessionContext>(
@@ -172,28 +181,53 @@ export class NotificationSessionController {
 	): Promise<NotificationSessionReconcileResult> {
 		const binding = this.bind(context);
 		try {
-			const cfg = this.#getConfig();
-			const runtime = this.#runtime as NotificationSessionRuntime<Context> | undefined;
-			const status = this.#status(binding, cfg, runtime);
-			if (!status.effectiveEnabled) {
-				if (runtime && status.running) await runtime.stop(binding);
-				return { outcome: status.running ? "stopped" : "disabled", status: this.#status(binding, cfg, runtime) };
-			}
-
-			if (!runtime) return { outcome: "disabled", status };
-			const outcome = status.running ? "already" : await runtime.start(binding);
-			const current = this.#status(binding, cfg, runtime);
-			if (!current.effectiveEnabled) {
-				if (current.running) await runtime.stop(binding);
-				return { outcome: current.running ? "stopped" : "disabled", status: this.#status(binding, cfg, runtime) };
-			}
-			if ((outcome === "started" || outcome === "already") && current.running && isTelegramConfigured(cfg)) {
-				await runtime.ensureTelegramDaemon?.(binding);
-			}
-			return { outcome, status: this.#status(binding, cfg, runtime) };
+			return await this.#enqueue(binding, () => this.#reconcile(binding));
 		} finally {
 			binding.unbind();
 		}
+	}
+
+	async #reconcile<Context extends NotificationSessionContext>(
+		binding: BoundNotificationSession<Context>,
+	): Promise<NotificationSessionReconcileResult> {
+		const cfg = this.#getConfig();
+		const runtime = this.#runtime as NotificationSessionRuntime<Context> | undefined;
+		const status = this.#status(binding, cfg, runtime);
+		if (!status.effectiveEnabled) {
+			if (runtime && status.running) await runtime.stop(binding);
+			return { outcome: status.running ? "stopped" : "disabled", status: this.#status(binding, cfg, runtime) };
+		}
+
+		if (!runtime) return { outcome: "disabled", status };
+		const outcome = status.running ? "already" : await runtime.start(binding);
+		const current = this.#status(binding, cfg, runtime);
+		if (!current.effectiveEnabled) {
+			if (current.running) await runtime.stop(binding);
+			return { outcome: current.running ? "stopped" : "disabled", status: this.#status(binding, cfg, runtime) };
+		}
+		if ((outcome === "started" || outcome === "already") && current.running && isTelegramConfigured(cfg)) {
+			await runtime.ensureTelegramDaemon?.(binding);
+		}
+		return { outcome, status: this.#status(binding, cfg, runtime) };
+	}
+
+	#enqueue<Context extends NotificationSessionContext, Result>(
+		binding: BoundNotificationSession<Context>,
+		operation: () => Promise<Result>,
+	): Promise<Result> {
+		const previous = this.#sessionOperations.get(binding.sessionId) ?? Promise.resolve();
+		const result = previous.then(operation, operation);
+		const completion = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.#sessionOperations.set(binding.sessionId, completion);
+		void completion.then(() => {
+			if (this.#sessionOperations.get(binding.sessionId) === completion) {
+				this.#sessionOperations.delete(binding.sessionId);
+			}
+		});
+		return result;
 	}
 
 	#query(binding: BoundNotificationSession<any>): NotificationSessionStatus {

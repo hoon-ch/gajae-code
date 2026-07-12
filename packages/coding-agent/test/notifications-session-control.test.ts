@@ -70,6 +70,49 @@ function createRuntime(calls: Call[]): NotificationSessionRuntime {
 	};
 }
 
+interface ConnectedFakeClient {
+	readonly frames: string[];
+	receive(frame: string): void;
+}
+
+function createConnectedFakeClient(): ConnectedFakeClient {
+	const frames: string[] = [];
+	return {
+		frames,
+		receive: frame => {
+			frames.push(frame);
+		},
+	};
+}
+
+function createFrameRuntime(
+	calls: Call[],
+	client: ConnectedFakeClient,
+	input: { startGate?: Promise<void>; onStart?: () => void } = {},
+): NotificationSessionRuntime {
+	const running = new Set<string>();
+	const record = (kind: Call["kind"], binding: BoundNotificationSession): void => {
+		calls.push({ kind, cwd: binding.cwd, sessionId: binding.sessionId });
+	};
+	return {
+		isRunning: binding => running.has(binding.sessionId),
+		start: async binding => {
+			record("start", binding);
+			if (running.has(binding.sessionId)) return "already";
+			input.onStart?.();
+			await input.startGate;
+			running.add(binding.sessionId);
+			client.receive(`identity_header:${binding.sessionId}`);
+			return "started";
+		},
+		stop: async binding => {
+			record("stop", binding);
+			return running.delete(binding.sessionId);
+		},
+		ensureTelegramDaemon: async () => {},
+	};
+}
+
 const telegramConfig = (): NotificationConfig => ({
 	...BASE_CONFIG,
 	enabled: true,
@@ -109,36 +152,70 @@ describe("NotificationSessionController", () => {
 		]);
 	});
 
-	test("after a blocked_identity commit, subsequent reconciliation keeps the endpoint stopped and sends zero foreign-client frames", async () => {
+	test("after a non-deferred blocked_identity commit, reconciliation keeps the endpoint stopped and emits no foreign-client frames", async () => {
 		const calls: Call[] = [];
-		let running = false;
-		let foreignClientFrames = 0;
+		const client = createConnectedFakeClient();
+		const runtime = createFrameRuntime(calls, client);
 		const controller = new NotificationSessionController({ eligible: true, getConfig: telegramConfig, env: {} });
-		controller.attachRuntime({
-			isRunning: () => running,
-			start: async binding => {
-				calls.push({ kind: "start", cwd: binding.cwd, sessionId: binding.sessionId });
-				running = true;
-				return "started";
-			},
-			stop: async binding => {
-				calls.push({ kind: "stop", cwd: binding.cwd, sessionId: binding.sessionId });
-				running = false;
-				return true;
-			},
-			ensureTelegramDaemon: async () => {},
-		});
+		controller.attachRuntime(runtime);
 		const { context } = createContext();
 
 		await controller.reconcileCurrentSession(context);
 		await controller.enterBlockedRuntime(context);
+		const framesAtBlockResolution = client.frames.length;
 		const afterBlockedReconcile = await controller.reconcileCurrentSession(context);
-		if (running) foreignClientFrames += 1;
+		const binding = controller.bind(context);
+		try {
+			expect(runtime.isRunning(binding)).toBe(false);
+		} finally {
+			binding.unbind();
+		}
 
 		expect(afterBlockedReconcile.outcome).toBe("disabled");
 		expect(afterBlockedReconcile.status.running).toBe(false);
 		expect(calls.map(call => call.kind)).toEqual(["start", "stop"]);
-		expect(foreignClientFrames).toBe(0);
+		expect(client.frames).toEqual(["identity_header:session-one"]);
+		expect(client.frames.slice(framesAtBlockResolution)).toHaveLength(0);
+	});
+
+	test("serializes a deferred endpoint start before blocking and emits no foreign-client frames after block resolution", async () => {
+		const calls: Call[] = [];
+		const client = createConnectedFakeClient();
+		const startEntered = Promise.withResolvers<void>();
+		const releaseStart = Promise.withResolvers<void>();
+		const runtime = createFrameRuntime(calls, client, {
+			startGate: releaseStart.promise,
+			onStart: () => startEntered.resolve(),
+		});
+		const controller = new NotificationSessionController({ eligible: true, getConfig: telegramConfig, env: {} });
+		controller.attachRuntime(runtime);
+		const { context } = createContext();
+
+		const reconciliation = controller.reconcileCurrentSession(context);
+		await startEntered.promise;
+		const blocked = controller.enterBlockedRuntime(context);
+		let blockResolved = false;
+		void blocked.then(() => {
+			blockResolved = true;
+		});
+		await Promise.resolve();
+		expect(blockResolved).toBe(false);
+
+		releaseStart.resolve();
+		await Promise.all([reconciliation, blocked]);
+		const framesAtBlockResolution = client.frames.length;
+		const afterBlockedReconcile = await controller.reconcileCurrentSession(context);
+		const binding = controller.bind(context);
+		try {
+			expect(runtime.isRunning(binding)).toBe(false);
+		} finally {
+			binding.unbind();
+		}
+
+		expect(afterBlockedReconcile.outcome).toBe("disabled");
+		expect(calls.map(call => call.kind)).toEqual(["start", "stop"]);
+		expect(client.frames).toEqual(["identity_header:session-one"]);
+		expect(client.frames.slice(framesAtBlockResolution)).toHaveLength(0);
 	});
 
 	test("starts generic endpoints for Discord, Slack, and token-only opt-in without Telegram daemon", async () => {

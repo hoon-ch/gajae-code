@@ -40,6 +40,23 @@ import {
 	theme,
 } from "../../modes/theme/theme";
 import type { InteractiveModeContext, OAuthSelectorOptions } from "../../modes/types";
+import { getNotificationConfig, maskToken } from "../../notifications/config";
+import {
+	proposedTelegramIdentity,
+	reconcileCommittedTelegramConfiguration,
+	removeTelegramConfiguration,
+	saveTelegramInactive,
+} from "../../notifications/notification-orchestration";
+import {
+	buildNotificationStatusReport,
+	checkNotificationHealth,
+	recoverNotifications,
+	sanitizeDiagnostic,
+	sendNotificationTest,
+} from "../../notifications/notification-service";
+import type { NotificationSessionStatus } from "../../notifications/session-control";
+import { ensureTelegramDaemonRunningDetailed } from "../../notifications/telegram-daemon";
+import { runTelegramSetup } from "../../notifications/telegram-setup";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
 import {
@@ -78,6 +95,10 @@ import type { PetMode } from "../components/gajae-pet-widget";
 import { HistorySearchComponent } from "../components/history-search";
 import { JobsOverlayComponent } from "../components/jobs-overlay";
 import { ModelSelectorComponent } from "../components/model-selector";
+import type {
+	NotificationsEditorOperations,
+	PreparedTelegramConfiguration,
+} from "../components/notifications-settings-editor";
 import { OAuthSelectorComponent } from "../components/oauth-selector";
 import { PetSelectorComponent } from "../components/pet-selector";
 import { PluginSelectorComponent } from "../components/plugin-selector";
@@ -139,6 +160,414 @@ function formatProviderOnboardingCommandGuide(): string {
 		MODEL_ONBOARDING_API_PROVIDER_COMMAND,
 		MODEL_ONBOARDING_SETUP_COMMAND,
 	].join("\n");
+}
+
+export interface NotificationsEditorAdapterContext {
+	settings: Settings;
+	session: Pick<InteractiveModeContext["session"], "notificationSessionController">;
+	sessionManager: Pick<InteractiveModeContext["sessionManager"], "getCwd" | "getSessionId">;
+	notifyConfigChanged?: () => Promise<void> | void;
+}
+
+export interface NotificationsEditorOperationDependencies {
+	getNotificationConfig: typeof getNotificationConfig;
+	maskToken: typeof maskToken;
+	buildNotificationStatusReport: typeof buildNotificationStatusReport;
+	checkNotificationHealth: typeof checkNotificationHealth;
+	sendNotificationTest: typeof sendNotificationTest;
+	recoverNotifications: typeof recoverNotifications;
+	sanitizeDiagnostic: typeof sanitizeDiagnostic;
+	ensureTelegramDaemonRunningDetailed: typeof ensureTelegramDaemonRunningDetailed;
+	runTelegramSetup: typeof runTelegramSetup;
+	proposedTelegramIdentity: typeof proposedTelegramIdentity;
+	reconcileCommittedTelegramConfiguration: typeof reconcileCommittedTelegramConfiguration;
+	saveTelegramInactive: typeof saveTelegramInactive;
+	removeTelegramConfiguration: typeof removeTelegramConfiguration;
+}
+
+const notificationEditorOperationDependencies: NotificationsEditorOperationDependencies = {
+	getNotificationConfig,
+	maskToken,
+	buildNotificationStatusReport,
+	checkNotificationHealth,
+	sendNotificationTest,
+	recoverNotifications,
+	sanitizeDiagnostic,
+	ensureTelegramDaemonRunningDetailed,
+	runTelegramSetup,
+	proposedTelegramIdentity,
+	reconcileCommittedTelegramConfiguration,
+	saveTelegramInactive,
+	removeTelegramConfiguration,
+};
+
+function unavailableNotificationSessionStatus(): NotificationSessionStatus {
+	return {
+		eligible: false,
+		locallyEnabled: true,
+		effectiveEnabled: false,
+		running: false,
+		environment: "off",
+	};
+}
+
+function unavailableNotificationSessionResult() {
+	return { outcome: "disabled" as const, status: unavailableNotificationSessionStatus() };
+}
+
+function notificationOperationError(
+	services: NotificationsEditorOperationDependencies,
+	error: unknown,
+	token?: string,
+): Error {
+	return new Error(
+		services.sanitizeDiagnostic(error instanceof Error ? error.message : "Notification operation failed.", token),
+	);
+}
+
+/**
+ * Concrete service adapter for the direct Notifications settings tab. Secrets remain in this closure's
+ * WeakMap and are never exposed through the editor's safe draft contract.
+ */
+export function createNotificationsEditorOperations(
+	ctx: NotificationsEditorAdapterContext,
+	overrides: Partial<NotificationsEditorOperationDependencies> = {},
+): NotificationsEditorOperations {
+	const services = { ...notificationEditorOperationDependencies, ...overrides };
+	const drafts = new WeakMap<PreparedTelegramConfiguration, string>();
+	const sessionContext = () => ({ sessionManager: ctx.sessionManager });
+	const notifyAfterDurableCommit = async (): Promise<void> => {
+		await ctx.notifyConfigChanged?.();
+	};
+	const reconnect = async () =>
+		await services.ensureTelegramDaemonRunningDetailed({
+			settings: ctx.settings,
+			cwd: ctx.sessionManager.getCwd(),
+			sessionId: ctx.sessionManager.getSessionId(),
+		});
+
+	return {
+		loadState: async () => {
+			const config = services.getNotificationConfig(ctx.settings);
+			return {
+				status: services.buildNotificationStatusReport(ctx.settings),
+				session:
+					ctx.session.notificationSessionController?.query(sessionContext()) ??
+					unavailableNotificationSessionStatus(),
+				preferences: {
+					redact: config.redact,
+					verbosity: config.verbosity,
+					sessionScope: config.sessionScope,
+					richEnabled: config.rich.enabled,
+					richDraftEnabled: config.richDraft.enabled,
+				},
+			};
+		},
+
+		refreshHealth: async ({ probe, signal }) => {
+			if (signal?.aborted) throw new Error("Notification health refresh cancelled.");
+			try {
+				const input: Parameters<typeof checkNotificationHealth>[0] & { signal?: AbortSignal } = {
+					settings: ctx.settings,
+					stateRoot: ctx.sessionManager.getCwd(),
+					probe,
+					signal,
+				};
+				const report = await services.checkNotificationHealth(input);
+				if (signal?.aborted) throw new Error("Notification health refresh cancelled.");
+				const token = services.getNotificationConfig(ctx.settings).botToken;
+				return {
+					...report,
+					checks: report.checks.map(check => ({
+						...check,
+						detail: services.sanitizeDiagnostic(check.detail, token),
+					})),
+					reachability: {
+						...report.reachability,
+						detail: services.sanitizeDiagnostic(report.reachability.detail, token),
+					},
+				};
+			} catch (error) {
+				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+			}
+		},
+
+		sendTest: async () => {
+			try {
+				const result = await services.sendNotificationTest({ settings: ctx.settings });
+				return {
+					...result,
+					detail: services.sanitizeDiagnostic(
+						result.detail,
+						services.getNotificationConfig(ctx.settings).botToken,
+					),
+				};
+			} catch (error) {
+				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+			}
+		},
+
+		recover: async () => {
+			try {
+				const result = await services.recoverNotifications({
+					settings: ctx.settings,
+					stateRoot: ctx.sessionManager.getCwd(),
+				});
+				return {
+					...result,
+					daemon: {
+						...result.daemon,
+						detail: services.sanitizeDiagnostic(
+							result.daemon.detail,
+							services.getNotificationConfig(ctx.settings).botToken,
+						),
+					},
+				};
+			} catch (error) {
+				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+			}
+		},
+
+		reconnect: async () => {
+			try {
+				const result = await reconnect();
+				if (result === "blocked_identity") {
+					await ctx.session.notificationSessionController?.stopCurrentSession(sessionContext());
+				}
+				return result;
+			} catch (error) {
+				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+			}
+		},
+
+		preflightProposedIdentity: async (input, signal) => {
+			const token = input.token.consume();
+			const unknownIdentity = { status: "unknown" as const };
+			if (!token.trim()) {
+				return {
+					status: "error",
+					identity: unknownIdentity,
+					message: "Telegram bot token is required.",
+				};
+			}
+			try {
+				const config = services.getNotificationConfig(ctx.settings);
+				// The editor always supplies an explicit chat ID, so runTelegramSetup validates it
+				// without polling even when a daemon currently owns another Telegram identity.
+				const setup = await services.runTelegramSetup({
+					token,
+					chatId: input.chatId,
+					preflight: { storedChatId: config.chatId },
+					interactive: false,
+					signal,
+					deps: { fetchImpl: globalThis.fetch },
+				});
+				if (!setup.ok) {
+					return {
+						status: setup.status === "aborted" ? "aborted" : setup.status === "cancelled" ? "cancelled" : "error",
+						identity: unknownIdentity,
+						message: services.sanitizeDiagnostic(setup.detail, token),
+					};
+				}
+				if (signal.aborted) {
+					return {
+						status: "aborted",
+						identity: unknownIdentity,
+						message: "Telegram setup cancelled.",
+					};
+				}
+				const identity = await services.proposedTelegramIdentity({
+					settings: ctx.settings,
+					botToken: token,
+					chatId: setup.chatId,
+					chatDisplay: setup.chatId,
+				});
+				if (signal.aborted) {
+					return {
+						status: "aborted",
+						identity,
+						message: "Telegram setup cancelled.",
+					};
+				}
+				const draft: PreparedTelegramConfiguration = {
+					chatId: setup.chatId,
+					tokenMask: services.maskToken(token),
+					tokenFingerprint: setup.tokenFingerprint,
+					richEnabled: input.richEnabled,
+					richDraftEnabled: input.richDraftEnabled,
+				};
+				drafts.set(draft, token);
+				return {
+					status: "ready",
+					identity,
+					draft,
+					message:
+						identity.status === "foreign" || identity.status === "unknown"
+							? "Telegram credentials and private chat validated; activation is blocked by the current daemon identity."
+							: "Telegram credentials and private chat validated.",
+				};
+			} catch (error) {
+				return {
+					status: signal.aborted ? "aborted" : "error",
+					identity: unknownIdentity,
+					message: signal.aborted
+						? "Telegram setup cancelled."
+						: services.sanitizeDiagnostic(
+								error instanceof Error ? error.message : "Telegram setup failed.",
+								token,
+							),
+				};
+			}
+		},
+
+		commitConfigure: async draft => {
+			const token = drafts.get(draft);
+			if (!token) throw new Error("The Telegram setup draft expired. Re-enter the masked bot token.");
+			try {
+				const receipt = await ctx.settings.commitAtomicBatch([
+					{ path: "notifications.enabled", op: "set", value: true },
+					{ path: "notifications.telegram.botToken", op: "set", value: token },
+					{ path: "notifications.telegram.chatId", op: "set", value: draft.chatId },
+					{ path: "notifications.telegram.rich.enabled", op: "set", value: draft.richEnabled },
+					{ path: "notifications.telegram.richDraft.enabled", op: "set", value: draft.richDraftEnabled },
+				]);
+				drafts.delete(draft);
+				const controller = ctx.session.notificationSessionController;
+				if (!controller) {
+					await notifyAfterDurableCommit();
+					return { status: "saved" as const, receipt, message: "Telegram configuration saved." };
+				}
+				const activation = await services.reconcileCommittedTelegramConfiguration({
+					receipt,
+					activation: {
+						controller: {
+							enterBlockedRuntime: async () => await controller.stopCurrentSession(sessionContext()),
+							clearBlockedRuntime: async () => undefined,
+							reconcileCurrentSession: async () => await controller.reconcileCurrentSession(sessionContext()),
+						},
+						reconnect,
+					},
+				});
+				await notifyAfterDurableCommit();
+				return {
+					status: activation.status === "blocked_identity" ? "blocked_identity" : "saved",
+					receipt,
+					message: services.sanitizeDiagnostic(
+						activation.status === "blocked_identity"
+							? activation.message
+							: "Telegram configuration saved and reconciled.",
+						token,
+					),
+				};
+			} catch (error) {
+				throw notificationOperationError(services, error, token);
+			}
+		},
+
+		saveInactive: async draft => {
+			const token = drafts.get(draft);
+			if (!token) throw new Error("The Telegram setup draft expired. Re-enter the masked bot token.");
+			try {
+				const result = await services.saveTelegramInactive({
+					settings: ctx.settings,
+					botToken: token,
+					chatId: draft.chatId,
+				});
+				if (result.status === "unavailable") {
+					return { status: "unavailable" as const, guidance: services.sanitizeDiagnostic(result.guidance, token) };
+				}
+				drafts.delete(draft);
+				await notifyAfterDurableCommit();
+				return {
+					status: "saved_inactive" as const,
+					receipt: result.receipt,
+					message: "Telegram configuration saved inactive; no runtime activation was requested.",
+				};
+			} catch (error) {
+				throw notificationOperationError(services, error, token);
+			}
+		},
+
+		discardConfigureDraft: draft => {
+			drafts.delete(draft);
+		},
+
+		enableGlobally: async () => {
+			try {
+				const receipt = await ctx.settings.commitAtomicBatch([
+					{ path: "notifications.enabled", op: "set", value: true },
+				]);
+				await notifyAfterDurableCommit();
+				return { receipt, message: "Global notifications enabled using stored configuration." };
+			} catch (error) {
+				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+			}
+		},
+
+		disableGlobally: async () => {
+			try {
+				const receipt = await ctx.settings.commitAtomicBatch([
+					{ path: "notifications.enabled", op: "set", value: false },
+				]);
+				await notifyAfterDurableCommit();
+				return { receipt, message: "Global notifications disabled." };
+			} catch (error) {
+				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+			}
+		},
+
+		removeTelegram: async () => {
+			try {
+				const result = await services.removeTelegramConfiguration({ settings: ctx.settings });
+				await notifyAfterDurableCommit();
+				return {
+					receipt: result.receipt,
+					globallyDisabled: result.globallyDisabled,
+					message: result.globallyDisabled
+						? "Telegram configuration removed and global notifications disabled."
+						: "Telegram configuration removed; Discord or Slack configuration was preserved.",
+				};
+			} catch (error) {
+				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+			}
+		},
+
+		setSessionLocal: async enabled => {
+			const controller = ctx.session.notificationSessionController;
+			if (!controller) return unavailableNotificationSessionResult();
+			try {
+				return await controller.setLocalEnabled(sessionContext(), enabled);
+			} catch (error) {
+				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+			}
+		},
+
+		commitPreferences: async preferences => {
+			try {
+				const receipt = await ctx.settings.commitAtomicBatch([
+					{ path: "notifications.redact", op: "set", value: preferences.redact },
+					{ path: "notifications.verbosity", op: "set", value: preferences.verbosity },
+					{ path: "notifications.sessionScope", op: "set", value: preferences.sessionScope },
+					{ path: "notifications.telegram.rich.enabled", op: "set", value: preferences.richEnabled },
+					{ path: "notifications.telegram.richDraft.enabled", op: "set", value: preferences.richDraftEnabled },
+				]);
+				await notifyAfterDurableCommit();
+				return { receipt, message: "Notification preferences saved atomically." };
+			} catch (error) {
+				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+			}
+		},
+
+		reconcileCurrentSession: async () => {
+			const controller = ctx.session.notificationSessionController;
+			if (!controller) return unavailableNotificationSessionResult();
+			try {
+				return await controller.reconcileCurrentSession(sessionContext());
+			} catch (error) {
+				throw notificationOperationError(services, error, services.getNotificationConfig(ctx.settings).botToken);
+			}
+		},
+	};
 }
 
 export class SelectorController {
@@ -485,6 +914,8 @@ export class SelectorController {
 	showSettingsSelector(): void {
 		getAvailableThemes().then(availableThemes => {
 			this.showSelector(done => {
+				const notificationsOperations = createNotificationsEditorOperations(this.ctx);
+
 				const selector = new SettingsSelectorComponent(
 					{
 						availableThinkingLevels: [...this.ctx.session.getAvailableThinkingLevels()],
@@ -540,6 +971,7 @@ export class SelectorController {
 							this.ctx.ui.requestRender();
 						},
 					},
+					notificationsOperations,
 				);
 				return { component: selector, focus: selector };
 			});

@@ -286,13 +286,16 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 		}
 		this.#disposed = true;
 		this.#abortController.abort();
-		await this.#cancellableWork?.catch(() => undefined);
 		this.#clearDrafts(true);
+		await this.#cancellableWork?.catch(() => undefined);
 		return true;
 	}
 
 	dispose(): void {
-		void this.requestDispose();
+		if (this.#disposed) return;
+		this.#disposed = true;
+		this.#abortController.abort();
+		this.#clearDrafts(true);
 	}
 
 	render(width: number): string[] {
@@ -411,10 +414,6 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 	}
 
 	#handleConfirmationInput(data: string): void {
-		const actions: readonly Action[] = [
-			{ id: "confirm", label: "Confirm", description: "Apply this global or adapter-local change." },
-			{ id: "cancel", label: "Cancel", description: "Return without changing configuration." },
-		];
 		if (this.#matchesCancel(data)) {
 			this.#confirmation = undefined;
 			this.#mode = "home";
@@ -630,19 +629,21 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 		})();
 	}
 
-	async #afterDurableMutation(): Promise<void> {
+	async #afterDurableMutation(): Promise<boolean> {
 		await this.operations.reconcileCurrentSession();
 		const health = await this.operations.refreshHealth({ probe: false });
-		if (this.#disposed) return;
+		if (this.#disposed) return false;
 		this.#state = { ...this.#state, health };
 		await this.#loadState();
+		return !this.#disposed;
 	}
 
-	async #refreshAfterOperation(): Promise<void> {
+	async #refreshAfterOperation(): Promise<boolean> {
 		const health = await this.operations.refreshHealth({ probe: false });
-		if (this.#disposed) return;
+		if (this.#disposed) return false;
 		this.#state = { ...this.#state, health };
 		await this.#loadState();
+		return !this.#disposed;
 	}
 
 	#enableGlobally(): void {
@@ -650,7 +651,8 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			"Enabling global notifications.",
 			() => this.operations.enableGlobally(),
 			async result => {
-				await this.#afterDurableMutation();
+				if (!(await this.#afterDurableMutation())) return;
+
 				this.#status = `OK — ${safeDetail(result.message, "Global notifications enabled using stored credentials.")}`;
 			},
 		);
@@ -664,7 +666,8 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				"Disabling notifications globally.",
 				() => this.operations.disableGlobally(),
 				async result => {
-					await this.#afterDurableMutation();
+					if (!(await this.#afterDurableMutation())) return;
+
 					this.#mode = "home";
 					this.#selectedIndex = 0;
 					this.#status = `OK — ${safeDetail(result.message, "Notifications disabled globally.")}`;
@@ -677,7 +680,8 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				"Removing Telegram configuration.",
 				() => this.operations.removeTelegram(),
 				async result => {
-					await this.#afterDurableMutation();
+					if (!(await this.#afterDurableMutation())) return;
+
 					this.#mode = "home";
 					this.#selectedIndex = 0;
 					this.#status = `OK — ${safeDetail(
@@ -706,7 +710,12 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			enabled ? "Enabling notifications for this session." : "Disabling notifications for this session.",
 			() => this.operations.setSessionLocal(enabled),
 			async result => {
-				await this.#refreshAfterOperation();
+				if (!(await this.#refreshAfterOperation())) return;
+
+				if (!result.status.eligible) {
+					this.#status = "WARNING — Session notification controls are unavailable in this host session.";
+					return;
+				}
 				this.#status = `OK — Session notifications ${result.status.locallyEnabled ? "enabled" : "disabled"}; runtime is ${
 					result.status.running ? "active" : "inactive"
 				}.`;
@@ -720,7 +729,8 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			() => this.operations.sendTest(),
 			async result => {
 				this.#lastTest = result;
-				await this.#refreshAfterOperation();
+				if (!(await this.#refreshAfterOperation())) return;
+
 				this.#status = `${result.ok ? "OK" : "ERROR"} — Test ${result.ok ? "delivered" : "failed"}: ${safeDetail(
 					result.detail,
 					"No delivery detail returned.",
@@ -734,7 +744,8 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			"Recovering notification delivery.",
 			() => this.operations.recover(),
 			async result => {
-				await this.#refreshAfterOperation();
+				if (!(await this.#refreshAfterOperation())) return;
+
 				this.#status = `OK — Recovery scanned ${result.endpointsScanned} endpoint(s); removed ${result.endpointsRemoved.length}. ${safeDetail(
 					result.daemon.detail,
 					"Daemon recovery completed.",
@@ -748,7 +759,8 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			"Reconnecting the Telegram runtime.",
 			() => this.operations.reconnect(),
 			async result => {
-				await this.#refreshAfterOperation();
+				if (!(await this.#refreshAfterOperation())) return;
+
 				this.#status =
 					result === "blocked_identity"
 						? "ERROR — Telegram activation is blocked by a foreign daemon. Current session is stopped; foreign daemon untouched."
@@ -768,7 +780,8 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			"Saving Telegram configuration.",
 			() => this.operations.commitConfigure(draft),
 			async result => {
-				await this.#afterDurableMutation();
+				if (!(await this.#afterDurableMutation())) return;
+
 				this.#clearDrafts();
 				this.#mode = "home";
 				this.#selectedIndex = 0;
@@ -795,7 +808,8 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 					this.#status = `WARNING — ${safeDetail(result.guidance, "Save inactive is unavailable while another adapter is globally enabled.")}`;
 					return;
 				}
-				await this.#afterDurableMutation();
+				if (!(await this.#afterDurableMutation())) return;
+
 				this.#clearDrafts();
 				this.#mode = "home";
 				this.#selectedIndex = 0;
@@ -811,7 +825,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			"Saving notification preferences.",
 			() => this.operations.commitPreferences(preferences),
 			async result => {
-				await this.#afterDurableMutation();
+				if (!(await this.#afterDurableMutation())) return;
 				this.#preferencesDraft = undefined;
 				this.#mode = "home";
 				this.#selectedIndex = 0;

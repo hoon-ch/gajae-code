@@ -1,6 +1,7 @@
 import { ThinkingLevel, type ThinkingLevel as ThinkingLevelValue } from "@gajae-code/agent-core";
 import type { Effort } from "@gajae-code/ai";
 import {
+	type Component,
 	Container,
 	Input,
 	matchesKey,
@@ -25,6 +26,10 @@ import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } 
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
+import {
+	type NotificationsEditorOperations,
+	NotificationsSettingsEditorComponent,
+} from "./notifications-settings-editor";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
 import { getSettingsForTab, type SettingDef } from "./settings-defs";
 import type { StatusLineSegmentOptions } from "./status-line";
@@ -702,6 +707,7 @@ export class SettingsSelectorComponent extends Container {
 	#tabBar: TabBar;
 	#currentList: SettingsList | null = null;
 	#pluginComponent: PluginSettingsComponent | null = null;
+	#notificationsEditor: NotificationsSettingsEditorComponent | null = null;
 	#statusPreviewContainer: Container | null = null;
 	#statusPreviewText: Text | null = null;
 	#currentTabId: SettingTab | "plugins" = "appearance";
@@ -710,6 +716,7 @@ export class SettingsSelectorComponent extends Container {
 	constructor(
 		private readonly context: SettingsRuntimeContext,
 		private readonly callbacks: SettingsCallbacks,
+		private readonly notificationsOperations?: NotificationsEditorOperations,
 	) {
 		super();
 
@@ -721,6 +728,7 @@ export class SettingsSelectorComponent extends Container {
 		this.#tabBar.onTabChange = () => {
 			this.#switchToTab(this.#tabBar.getActiveTab().id as SettingTab | "plugins");
 		};
+
 		this.addChild(this.#tabBar);
 
 		// Spacer after tab bar
@@ -734,6 +742,9 @@ export class SettingsSelectorComponent extends Container {
 	}
 
 	#switchToTab(tabId: SettingTab | "plugins"): void {
+		if (this.#currentTabId === "notifications" && tabId !== "notifications" && !this.#disposeNotificationsEditor()) {
+			return;
+		}
 		this.#currentTabId = tabId;
 
 		// Remove current content
@@ -757,12 +768,24 @@ export class SettingsSelectorComponent extends Container {
 
 		if (tabId === "plugins") {
 			this.#showPluginsTab();
+		} else if (tabId === "notifications") {
+			this.#showNotificationsTab();
 		} else {
 			this.#showSettingsTab(tabId);
 		}
 
 		// Re-add bottom border
 		this.addChild(bottomBorder);
+	}
+
+	#disposeNotificationsEditor(): boolean {
+		const editor = this.#notificationsEditor;
+		if (!editor) return true;
+		if (editor.navigationLocked) return false;
+		editor.dispose();
+		this.removeChild(editor);
+		this.#notificationsEditor = null;
+		return true;
 	}
 
 	/**
@@ -1007,6 +1030,14 @@ export class SettingsSelectorComponent extends Container {
 		}
 	}
 
+	#showNotificationsTab(): void {
+		if (!this.notificationsOperations) return;
+		this.#notificationsEditor = new NotificationsSettingsEditorComponent(this.notificationsOperations, {
+			onCancel: () => this.callbacks.onCancel(),
+		});
+		this.addChild(this.#notificationsEditor);
+	}
+
 	/**
 	 * Show a settings tab using definitions.
 	 */
@@ -1171,21 +1202,38 @@ export class SettingsSelectorComponent extends Container {
 		this.addChild(this.#pluginComponent);
 	}
 
-	getFocusComponent(): SettingsList | PluginSettingsComponent {
-		// Return the current focusable component - one of these will always be set
-		return (this.#currentList || this.#pluginComponent)!;
+	getFocusComponent(): Component {
+		return (this.#currentList || this.#pluginComponent || this.#notificationsEditor)!;
+	}
+
+	override dispose(): void {
+		this.#notificationsEditor?.dispose();
+		this.#notificationsEditor = null;
+		super.dispose();
 	}
 
 	handleInput(data: string): void {
+		const tabNavigation =
+			matchesKey(data, "tab") ||
+			matchesKey(data, "shift+tab") ||
+			matchesKey(data, "left") ||
+			matchesKey(data, "right");
+		if (this.#notificationsEditor && this.#currentTabId === "notifications") {
+			if (tabNavigation) {
+				if (this.#notificationsEditor.navigationLocked) {
+					this.#notificationsEditor.handleInput(data);
+					return;
+				}
+				this.#tabBar.handleInput(data);
+				return;
+			}
+			this.#notificationsEditor.handleInput(data);
+			return;
+		}
+
 		// Handle tab switching — but NOT when a text input is active, since
 		// arrow keys must reach the cursor and Tab must not switch tabs.
-		if (
-			!this.#textInputActive &&
-			(matchesKey(data, "tab") ||
-				matchesKey(data, "shift+tab") ||
-				matchesKey(data, "left") ||
-				matchesKey(data, "right"))
-		) {
+		if (!this.#textInputActive && tabNavigation) {
 			this.#tabBar.handleInput(data);
 			return;
 		}

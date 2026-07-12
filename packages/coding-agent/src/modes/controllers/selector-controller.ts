@@ -55,8 +55,8 @@ import {
 	sendNotificationTest,
 } from "../../notifications/notification-service";
 import type { NotificationSessionStatus } from "../../notifications/session-control";
-import { ensureTelegramDaemonRunningDetailed } from "../../notifications/telegram-daemon";
-import { runTelegramSetup } from "../../notifications/telegram-setup";
+import { ensureTelegramDaemonRunningDetailed, readDaemonState } from "../../notifications/telegram-daemon";
+import { runTelegramSetup, type TelegramSetupPreflight } from "../../notifications/telegram-setup";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
 import {
@@ -245,6 +245,32 @@ export function createNotificationsEditorOperations(
 			cwd: ctx.sessionManager.getCwd(),
 			sessionId: ctx.sessionManager.getSessionId(),
 		});
+	const telegramSetupPreflight = async (): Promise<TelegramSetupPreflight> => {
+		const storedChatId = services.getNotificationConfig(ctx.settings).chatId;
+		try {
+			const state = await readDaemonState(ctx.settings);
+			const validPid = Number.isSafeInteger(state?.pid) && (state?.pid ?? 0) > 0;
+			if (!state || !validPid) return { storedChatId };
+			let live = false;
+			try {
+				process.kill(state.pid, 0);
+				live = true;
+			} catch (error) {
+				live = (error as NodeJS.ErrnoException).code === "EPERM";
+			}
+			return live
+				? {
+						storedChatId,
+						daemon: {
+							live,
+							tokenFingerprint: typeof state.tokenFingerprint === "string" ? state.tokenFingerprint : undefined,
+						},
+					}
+				: { storedChatId };
+		} catch {
+			return { storedChatId };
+		}
+	};
 
 	return {
 		loadState: async () => {
@@ -331,8 +357,12 @@ export function createNotificationsEditorOperations(
 		reconnect: async () => {
 			try {
 				const result = await reconnect();
+				const controller = ctx.session.notificationSessionController;
 				if (result === "blocked_identity") {
-					await ctx.session.notificationSessionController?.stopCurrentSession(sessionContext());
+					await controller?.enterBlockedRuntime(sessionContext());
+				} else if (result === "spawned" || result === "reloaded" || result === "attached") {
+					await controller?.clearBlockedRuntime(sessionContext());
+					await controller?.reconcileCurrentSession(sessionContext());
 				}
 				return result;
 			} catch (error) {
@@ -351,13 +381,10 @@ export function createNotificationsEditorOperations(
 				};
 			}
 			try {
-				const config = services.getNotificationConfig(ctx.settings);
-				// The editor always supplies an explicit chat ID, so runTelegramSetup validates it
-				// without polling even when a daemon currently owns another Telegram identity.
 				const setup = await services.runTelegramSetup({
 					token,
 					chatId: input.chatId,
-					preflight: { storedChatId: config.chatId },
+					preflight: await telegramSetupPreflight(),
 					interactive: false,
 					signal,
 					deps: { fetchImpl: globalThis.fetch },
@@ -397,14 +424,21 @@ export function createNotificationsEditorOperations(
 					richDraftEnabled: input.richDraftEnabled,
 				};
 				drafts.set(draft, token);
+				const pairingMessage =
+					setup.pairingSource === "discovered"
+						? "Telegram private chat discovered and validated."
+						: setup.pairingSource === "reused"
+							? "Stored Telegram private chat validated without polling."
+							: "Supplied Telegram private chat validated.";
 				return {
 					status: "ready",
 					identity,
 					draft,
+					pairingSource: setup.pairingSource,
 					message:
 						identity.status === "foreign" || identity.status === "unknown"
-							? "Telegram credentials and private chat validated; activation is blocked by the current daemon identity."
-							: "Telegram credentials and private chat validated.",
+							? `${pairingMessage} Activation is blocked by the current daemon identity.`
+							: pairingMessage,
 				};
 			} catch (error) {
 				return {
@@ -441,23 +475,33 @@ export function createNotificationsEditorOperations(
 					receipt,
 					activation: {
 						controller: {
-							enterBlockedRuntime: async () => await controller.stopCurrentSession(sessionContext()),
-							clearBlockedRuntime: async () => undefined,
+							enterBlockedRuntime: async () => await controller.enterBlockedRuntime(sessionContext()),
+							clearBlockedRuntime: async () => await controller.clearBlockedRuntime(sessionContext()),
 							reconcileCurrentSession: async () => await controller.reconcileCurrentSession(sessionContext()),
 						},
 						reconnect,
 					},
 				});
 				await notifyAfterDurableCommit();
+				if (activation.status === "blocked_identity") {
+					return {
+						status: "blocked_identity" as const,
+						receipt,
+						message: services.sanitizeDiagnostic(activation.message, token),
+						restore: async () => {
+							const restored = await activation.restore();
+							if (restored.status === "restored" || restored.status === "still_blocked") {
+								await notifyAfterDurableCommit();
+							}
+							return restored;
+						},
+						retainCommitted: () => activation.retainCommitted(),
+					};
+				}
 				return {
-					status: activation.status === "blocked_identity" ? "blocked_identity" : "saved",
+					status: "saved" as const,
 					receipt,
-					message: services.sanitizeDiagnostic(
-						activation.status === "blocked_identity"
-							? activation.message
-							: "Telegram configuration saved and reconciled.",
-						token,
-					),
+					message: services.sanitizeDiagnostic("Telegram configuration saved and reconciled.", token),
 				};
 			} catch (error) {
 				throw notificationOperationError(services, error, token);

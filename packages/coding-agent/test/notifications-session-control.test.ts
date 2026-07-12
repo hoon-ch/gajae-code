@@ -109,6 +109,38 @@ describe("NotificationSessionController", () => {
 		]);
 	});
 
+	test("after a blocked_identity commit, subsequent reconciliation keeps the endpoint stopped and sends zero foreign-client frames", async () => {
+		const calls: Call[] = [];
+		let running = false;
+		let foreignClientFrames = 0;
+		const controller = new NotificationSessionController({ eligible: true, getConfig: telegramConfig, env: {} });
+		controller.attachRuntime({
+			isRunning: () => running,
+			start: async binding => {
+				calls.push({ kind: "start", cwd: binding.cwd, sessionId: binding.sessionId });
+				running = true;
+				return "started";
+			},
+			stop: async binding => {
+				calls.push({ kind: "stop", cwd: binding.cwd, sessionId: binding.sessionId });
+				running = false;
+				return true;
+			},
+			ensureTelegramDaemon: async () => {},
+		});
+		const { context } = createContext();
+
+		await controller.reconcileCurrentSession(context);
+		await controller.enterBlockedRuntime(context);
+		const afterBlockedReconcile = await controller.reconcileCurrentSession(context);
+		if (running) foreignClientFrames += 1;
+
+		expect(afterBlockedReconcile.outcome).toBe("disabled");
+		expect(afterBlockedReconcile.status.running).toBe(false);
+		expect(calls.map(call => call.kind)).toEqual(["start", "stop"]);
+		expect(foreignClientFrames).toBe(0);
+	});
+
 	test("starts generic endpoints for Discord, Slack, and token-only opt-in without Telegram daemon", async () => {
 		for (const input of [
 			{ config: discordConfig(), env: {} },

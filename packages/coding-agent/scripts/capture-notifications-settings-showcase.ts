@@ -12,7 +12,7 @@ import {
 const CANONICAL_COMMAND =
 	"bun packages/coding-agent/scripts/capture-notifications-settings-showcase.ts --output .gjc/qa/issue-2050-notifications";
 const DETERMINISTIC_CAPTURE_TIMESTAMP = "1970-01-01T00:00:00.000Z";
-const CAPTURE_TOOL_VERSION = "notifications-settings-showcase-live-editor-v1";
+const CAPTURE_TOOL_VERSION = "notifications-settings-showcase-live-settings-selector-v2";
 
 interface ArtifactFile {
 	path: string;
@@ -29,7 +29,7 @@ interface ManifestEntry {
 		rows: number;
 	};
 	render_mode: string;
-	capture_mode: "live-editor";
+	capture_mode: "live-settings-selector";
 	files: ArtifactFile[];
 }
 
@@ -276,15 +276,16 @@ async function captureEntry(entry: NotificationsSettingsShowcaseEntry, outputRoo
 			font_rendering_assumptions:
 				"Embedded red-claw theme at deterministic truecolor; HTML uses a monospace terminal fallback stack.",
 			wrapping_policy:
-				"NotificationsSettingsEditorComponent.render(width) uses ANSI-aware cell truncation and wrapping at the declared viewport width.",
+				"SettingsSelectorComponent renders the Notifications tab; status labels remain on one line and status guidance wraps with ANSI-aware terminal-cell width handling.",
 			ansi_control_semantics:
 				"terminal-ansi.txt preserves emitted SGR sequences; terminal.txt and ascii-no-color captures strip them.",
 		},
-		editor_render: {
-			component: "NotificationsSettingsEditorComponent",
+		selector_render: {
+			component: "SettingsSelectorComponent",
+			active_tab: rendered.selectorTab,
+			notifications_editor: "NotificationsSettingsEditorComponent",
 			operations: "deterministic in-memory NotificationsEditorOperations fake",
 			fixed_clock_timestamp: rendered.fixedClockTimestamp,
-			mode: rendered.mode,
 			navigation: rendered.navigation,
 			state: rendered.state,
 		},
@@ -343,7 +344,7 @@ async function main(): Promise<void> {
 	const manifest = json({
 		schema_version: 1,
 		capture_tool: CAPTURE_TOOL_VERSION,
-		capture_mode: "live-editor",
+		capture_mode: "live-settings-selector",
 		command: CANONICAL_COMMAND,
 		expected_entry_count: NOTIFICATIONS_SETTINGS_SHOWCASE_EXPECTED_ENTRY_COUNT,
 		entry_count: entries.length,
@@ -360,7 +361,7 @@ async function main(): Promise<void> {
 	await Bun.write(path.join(outputRoot, "independent-review.json"), json(pendingIndependentReview(manifestSha256)));
 
 	process.stdout.write(
-		`Captured ${entries.length} deterministic Notifications live-editor showcase entries to ${outputRoot}\nmanifest.json sha256: ${manifestSha256}\n`,
+		`Captured ${entries.length} deterministic Notifications settings-selector showcase entries to ${outputRoot}\nmanifest.json sha256: ${manifestSha256}\n`,
 	);
 }
 

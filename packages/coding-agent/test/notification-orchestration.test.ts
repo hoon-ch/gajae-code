@@ -311,4 +311,100 @@ describe("notification orchestration blocked runtime", () => {
 		]);
 		expect(discarded).toBe(true);
 	});
+	test("blocked-identity restore succeeds through the CAS receipt and clears runtime only after safe reconnect", async () => {
+		const events: string[] = [];
+		let reconnectAttempts = 0;
+		const settings: NotificationConfigurationWriter = {
+			getAgentDir: () => "/tmp/gjc-notification-orchestration",
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () => receipt(),
+		};
+		const result = await saveTelegramConfiguration({
+			settings,
+			botToken: TOKEN,
+			chatId: "new-chat",
+			saveInactive: false,
+			preflight: async () => ({ status: "absent" }),
+			activation: {
+				controller: {
+					enterBlockedRuntime: async () => events.push("enter-blocked"),
+					clearBlockedRuntime: async () => events.push("clear-blocked"),
+					reconcileCurrentSession: async () => events.push("reconcile"),
+				},
+				reconnect: async () => {
+					reconnectAttempts += 1;
+					return reconnectAttempts === 1 ? "blocked_identity" : "attached";
+				},
+			},
+		});
+
+		expect(result.status).toBe("blocked_identity");
+		if (result.status !== "blocked_identity") throw new Error("Expected blocked identity result.");
+		expect(await result.restore()).toEqual({ status: "restored", reconnect: "attached" });
+		expect(events).toEqual(["enter-blocked", "clear-blocked", "reconcile"]);
+	});
+
+	test("blocked-identity restore reports a CAS conflict and keeps the saved inactive configuration", async () => {
+		const events: string[] = [];
+		const conflictReceipt: CasReceipt = {
+			revisions: [],
+			restore: async () => ({ status: "conflict", paths: ["notifications.telegram.chatId"] }),
+			discard: () => {},
+		};
+		const settings: NotificationConfigurationWriter = {
+			getAgentDir: () => "/tmp/gjc-notification-orchestration",
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () => conflictReceipt,
+		};
+		const result = await saveTelegramConfiguration({
+			settings,
+			botToken: TOKEN,
+			chatId: "new-chat",
+			saveInactive: false,
+			preflight: async () => ({ status: "absent" }),
+			activation: {
+				controller: {
+					enterBlockedRuntime: async () => events.push("enter-blocked"),
+					clearBlockedRuntime: async () => events.push("clear-blocked"),
+					reconcileCurrentSession: async () => events.push("reconcile"),
+				},
+				reconnect: async () => "blocked_identity",
+			},
+		});
+
+		if (result.status !== "blocked_identity") throw new Error("Expected blocked identity result.");
+		expect(await result.restore()).toEqual({ status: "conflict", paths: ["notifications.telegram.chatId"] });
+		expect(events).toEqual(["enter-blocked"]);
+	});
+
+	test("blocked-identity retain path discards the restore receipt while keeping runtime blocked", async () => {
+		let discarded = false;
+		const settings: NotificationConfigurationWriter = {
+			getAgentDir: () => "/tmp/gjc-notification-orchestration",
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () =>
+				receipt(() => {
+					discarded = true;
+				}),
+		};
+		const result = await saveTelegramConfiguration({
+			settings,
+			botToken: TOKEN,
+			chatId: "new-chat",
+			saveInactive: false,
+			preflight: async () => ({ status: "absent" }),
+			activation: {
+				controller: {
+					enterBlockedRuntime: async () => {},
+					clearBlockedRuntime: async () => {},
+					reconcileCurrentSession: async () => {},
+				},
+				reconnect: async () => "blocked_identity",
+			},
+		});
+
+		if (result.status !== "blocked_identity") throw new Error("Expected blocked identity result.");
+		result.retainCommitted();
+		expect(discarded).toBe(true);
+	});
 });

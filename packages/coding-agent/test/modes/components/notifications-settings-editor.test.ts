@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import {
+	type NotificationsConfigureCommitResult,
 	type NotificationsEditorOperations,
 	type NotificationsEditorPreferences,
 	type NotificationsEditorSetupInput,
@@ -91,6 +92,13 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 	preflightSignal: AbortSignal | undefined;
 	healthSignal: AbortSignal | undefined;
 	removedTelegram = false;
+	preflightChatId: string | undefined;
+	commitResult: NotificationsConfigureCommitResult = {
+		status: "saved",
+		receipt: {} as never,
+		message: "Telegram configuration saved.",
+	};
+	reconcileCalls = 0;
 
 	async loadState(): Promise<NotificationsEditorState> {
 		return this.state;
@@ -129,14 +137,16 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 		signal: AbortSignal,
 	): Promise<NotificationsPreflightResult> {
 		this.preflightSignal = signal;
+		this.preflightChatId = input.chatId;
 		void input.token.consume();
 		if (this.preflightGate) return await this.preflightGate.promise;
 		return {
 			status: "ready",
 			identity: { status: "absent" },
 			message: "Telegram destination is ready.",
+			pairingSource: input.chatId === undefined ? "discovered" : "provided",
 			draft: {
-				chatId: input.chatId,
+				chatId: input.chatId ?? "discovered-chat",
 				tokenMask: "••••••••",
 				tokenFingerprint: "telegram:cafefeed",
 				richEnabled: input.richEnabled,
@@ -146,7 +156,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 	}
 
 	async commitConfigure() {
-		return { status: "saved" as const, receipt: {} as never, message: "Telegram configuration saved." };
+		return this.commitResult;
 	}
 
 	async saveInactive() {
@@ -200,6 +210,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 	}
 
 	async reconcileCurrentSession() {
+		this.reconcileCalls += 1;
 		return { outcome: "already" as const, status: this.state.session };
 	}
 }
@@ -214,12 +225,47 @@ function select(component: NotificationsSettingsEditorComponent, index: number):
 
 function enterTelegramToken(component: NotificationsSettingsEditorComponent, token: string): void {
 	component.handleInput("\n");
+	component.handleInput("\n");
 	component.handleInput("1001");
 	component.handleInput("\n");
 	component.handleInput(token);
 }
 
+function enterTelegramTokenWithoutChat(component: NotificationsSettingsEditorComponent, token: string): void {
+	component.handleInput("\n");
+	component.handleInput("\n");
+	component.handleInput("\n");
+	component.handleInput(token);
+}
+
 describe("NotificationsSettingsEditorComponent", () => {
+	it("requires an explicit provider choice before the optional private-chat ID step", async () => {
+		const component = new NotificationsSettingsEditorComponent(new FakeNotificationsOperations());
+		await flush();
+
+		component.handleInput("\n");
+		expect(component.mode).toBe("provider-selection");
+		expect(render(component)).toContain("Choose a notification provider");
+		expect(render(component)).toContain("Telegram");
+
+		component.handleInput("\n");
+		expect(component.mode).toBe("chat-entry");
+		expect(render(component)).toContain("private chat ID (optional)");
+	});
+
+	it("wraps CJK status guidance without truncating any localized sentence", async () => {
+		const operations = new FakeNotificationsOperations();
+		operations.state.health!.checks[0]!.detail =
+			"한국어 안내 문장은 단어 중간에서 잘리지 않고 안전하게 줄바꿈됩니다. 日本語の案内文は途中で切れず、安全に折り返されます。 中文提示语不会在词语中间截断，而会安全换行。";
+		const component = new NotificationsSettingsEditorComponent(operations);
+		await flush();
+
+		const compact = render(component, 80).replace(/\s+/g, "");
+		expect(compact).toContain("한국어안내문장은단어중간에서잘리지않고안전하게줄바꿈됩니다.");
+		expect(compact).toContain("日本語の案内文は途中で切れず、安全に折り返されます。");
+		expect(compact).toContain("中文提示语不会在词语中间截断，而会安全换行。");
+	});
+
 	it("uses masked secret entry and keeps all drafts out of settings until an explicit commit", async () => {
 		const operations = new FakeNotificationsOperations();
 		const component = new NotificationsSettingsEditorComponent(operations);
@@ -253,6 +299,93 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(operations.committedPreferences).toEqual([
 			{ redact: true, verbosity: "lean", sessionScope: "all", richEnabled: true, richDraftEnabled: false },
 		]);
+	});
+
+	it("guides pairing discovery without a chat ID and accurately labels supplied-chat validation", async () => {
+		const discoveryOperations = new FakeNotificationsOperations();
+		discoveryOperations.preflightGate = deferred();
+		const discovery = new NotificationsSettingsEditorComponent(discoveryOperations);
+		await flush();
+
+		enterTelegramTokenWithoutChat(discovery, "123456:abcdefghijklmnopqrstuvwxyz_ABCDE");
+		discovery.handleInput("\n");
+		expect(discovery.mode).toBe("pairing");
+		expect(render(discovery)).toContain("pairing discovery");
+		expect(discoveryOperations.preflightChatId).toBeUndefined();
+		discovery.handleInput("\x1b");
+
+		const validationOperations = new FakeNotificationsOperations();
+		validationOperations.preflightGate = deferred();
+		const validation = new NotificationsSettingsEditorComponent(validationOperations);
+		await flush();
+		enterTelegramToken(validation, "123456:abcdefghijklmnopqrstuvwxyz_ABCDE");
+		validation.handleInput("\n");
+		expect(validation.mode).toBe("pairing");
+		expect(render(validation)).toContain("private-chat validation");
+		expect(validationOperations.preflightChatId).toBe("1001");
+		validation.handleInput("\x1b");
+	});
+
+	it("shows a safer CAS restore default after blocked activation and reports restore conflicts without reconciliation", async () => {
+		const operations = new FakeNotificationsOperations();
+		let restoreCalls = 0;
+		operations.commitResult = {
+			status: "blocked_identity",
+			receipt: {} as never,
+			message: "Configuration saved but activation blocked by a foreign daemon.",
+			restore: async () => {
+				restoreCalls += 1;
+				return { status: "conflict", paths: ["notifications.telegram.chatId"] };
+			},
+			retainCommitted: () => {},
+		};
+		const component = new NotificationsSettingsEditorComponent(operations);
+		await flush();
+
+		enterTelegramToken(component, "123456:abcdefghijklmnopqrstuvwxyz_ABCDE");
+		component.handleInput("\n");
+		await flush();
+		component.handleInput("\n");
+		await flush();
+		expect(component.mode).toBe("confirmation");
+		expect(render(component)).toContain("Configuration saved but activation blocked by a foreign daemon");
+		expect(render(component)).toContain("Restore previous configuration");
+		expect(render(component)).toContain("Keep saved (inactive)");
+		expect(operations.reconcileCalls).toBe(0);
+
+		component.handleInput("\n");
+		await flush();
+		expect(restoreCalls).toBe(1);
+		expect(operations.reconcileCalls).toBe(0);
+		expect(render(component)).toContain("settings changed at: notifications.telegram.chatId");
+	});
+
+	it("retains blocked configuration only when Keep saved (inactive) is explicitly selected", async () => {
+		const operations = new FakeNotificationsOperations();
+		let retained = 0;
+		operations.commitResult = {
+			status: "blocked_identity",
+			receipt: {} as never,
+			message: "Configuration saved but activation blocked by a foreign daemon.",
+			restore: async () => ({ status: "restored", reconnect: "attached" }),
+			retainCommitted: () => {
+				retained += 1;
+			},
+		};
+		const component = new NotificationsSettingsEditorComponent(operations);
+		await flush();
+
+		enterTelegramToken(component, "123456:abcdefghijklmnopqrstuvwxyz_ABCDE");
+		component.handleInput("\n");
+		await flush();
+		component.handleInput("\n");
+		await flush();
+		component.handleInput("\x1b[B");
+		component.handleInput("\n");
+		await flush();
+		expect(retained).toBe(1);
+		expect(operations.reconcileCalls).toBe(0);
+		expect(render(component)).toContain("Saved configuration remains inactive.");
 	});
 
 	it("honors Escape for local cancellation, confirmation cancellation, and the parent cancel callback", async () => {
@@ -296,7 +429,7 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(render(component)).toContain("Telegram removed; Discord and Slack remain enabled.");
 	});
 
-	it("locks non-cancellable delivery, aborts cancellable work, and ignores late results after disposal", async () => {
+	it("locks non-cancellable delivery, aborts cancellable pairing, and runs health probes to completion", async () => {
 		const operations = new FakeNotificationsOperations();
 		operations.testGate = deferred();
 		const component = new NotificationsSettingsEditorComponent(operations);
@@ -317,7 +450,7 @@ describe("NotificationsSettingsEditorComponent", () => {
 		component.handleInput("\x1b[B");
 		component.handleInput("\n");
 		await flush();
-		expect(render(component)).toContain("ERROR — Notification action failed safely.");
+		expect(render(component)).toContain("ERROR\n    Notification action failed safely.");
 
 		const pairingOperations = new FakeNotificationsOperations();
 		pairingOperations.preflightGate = deferred();
@@ -344,13 +477,17 @@ describe("NotificationsSettingsEditorComponent", () => {
 		await flush();
 		select(probe, 5);
 		probe.handleInput("\n");
-		const disposing = probe.requestDispose();
-		expect(probeOperations.healthSignal?.aborted).toBe(true);
+		expect(probe.navigationLocked).toBe(true);
+		expect(probeOperations.healthSignal).toBeUndefined();
+		expect(render(probe)).toContain("cannot be cancelled once started");
+		probe.handleInput("\x1b");
+		expect(render(probe)).toContain("Navigation is locked");
 		probeOperations.healthGate.resolve({
 			...health("ok"),
-			checks: [{ name: "reachability", level: "ok", detail: "late health result" }],
+			checks: [{ name: "reachability", level: "ok", detail: "probe completed" }],
 		});
-		expect(await disposing).toBe(true);
-		expect(render(probe)).not.toContain("late health result");
+		await flush();
+		expect(probe.navigationLocked).toBe(false);
+		expect(render(probe)).toContain("probe completed");
 	});
 });

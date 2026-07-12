@@ -204,7 +204,8 @@ describe("notification settings controller adapter", () => {
 			query: vi.fn(() => sessionStatus()),
 			setLocalEnabled: vi.fn(async () => sessionResult()),
 			reconcileCurrentSession: vi.fn(async () => sessionResult()),
-			stopCurrentSession: vi.fn(async () => true),
+			enterBlockedRuntime: vi.fn(async () => true),
+			clearBlockedRuntime: vi.fn(async () => undefined),
 		};
 		const settings = {
 			getAgentDir: () => "/tmp/gjc-notifications",
@@ -254,13 +255,14 @@ describe("notification settings controller adapter", () => {
 			},
 			runTelegramSetup: async input => {
 				setupCalls.push(input as unknown as Record<string, unknown>);
+				const discovered = input.chatId === undefined;
 				return {
 					ok: true,
-					chatId: "validated-chat",
+					chatId: discovered ? "discovered-chat" : "validated-chat",
 					tokenFingerprint: "fingerprint",
 					threadedMode: "enabled",
 					threadedLabel: "verified",
-					pairingSource: "provided",
+					pairingSource: discovered ? "discovered" : "provided",
 				};
 			},
 			proposedTelegramIdentity: async input => {
@@ -282,6 +284,12 @@ describe("notification settings controller adapter", () => {
 		await operations.sendTest();
 		await operations.recover();
 		await operations.reconnect();
+		expect(controller.clearBlockedRuntime).toHaveBeenCalledWith(
+			expect.objectContaining({ sessionManager: ctx.sessionManager }),
+		);
+		expect(controller.reconcileCurrentSession).toHaveBeenCalledWith(
+			expect.objectContaining({ sessionManager: ctx.sessionManager }),
+		);
 		expect(healthCalls).toContainEqual(
 			expect.objectContaining({ stateRoot: "/workspace/current", probe: true, signal }),
 		);
@@ -299,6 +307,19 @@ describe("notification settings controller adapter", () => {
 		});
 		expect(setupCalls[0]).toMatchObject({ chatId: "input-chat", interactive: false });
 		expect(identityCalls[0]).toMatchObject({ chatId: "validated-chat", chatDisplay: "validated-chat" });
+
+		const discoveredPreflight = await operations.preflightProposedIdentity(
+			{ token: secret() as never, richEnabled: true, richDraftEnabled: false },
+			new AbortController().signal,
+		);
+		expect(setupCalls[1]).toMatchObject({ chatId: undefined, interactive: false });
+		expect(discoveredPreflight).toMatchObject({
+			status: "ready",
+			pairingSource: "discovered",
+			draft: { chatId: "discovered-chat" },
+		});
+		if (!discoveredPreflight.draft) throw new Error("Expected discovered setup draft.");
+		operations.discardConfigureDraft(discoveredPreflight.draft);
 		if (!firstPreflight.draft) throw new Error("Expected prepared Telegram draft.");
 		await operations.commitConfigure(firstPreflight.draft);
 		expect(batches[0]).toEqual([
@@ -375,16 +396,17 @@ describe("notification settings controller adapter", () => {
 		await expect(operations.commitConfigure(discarded.draft)).rejects.toThrow("draft expired");
 	});
 
-	it("stops the current endpoint before reporting a blocked committed identity", async () => {
+	it("enters controller-owned blocked runtime before reporting a blocked committed identity", async () => {
 		const events: string[] = [];
 		const controller = {
 			query: () => sessionStatus(),
 			setLocalEnabled: async () => sessionResult(),
 			reconcileCurrentSession: async () => sessionResult(),
-			stopCurrentSession: async () => {
-				events.push("stop");
+			enterBlockedRuntime: async () => {
+				events.push("enter-blocked");
 				return true;
 			},
+			clearBlockedRuntime: async () => undefined,
 		};
 		const settings = {
 			getAgentDir: () => "/tmp/gjc-notifications",
@@ -422,8 +444,12 @@ describe("notification settings controller adapter", () => {
 			new AbortController().signal,
 		);
 		if (!result.draft) throw new Error("Expected prepared Telegram draft.");
-		expect(await operations.commitConfigure(result.draft)).toMatchObject({ status: "blocked_identity" });
-		expect(events).toEqual(["commit", "ensure", "stop", "notify"]);
+		const committed = await operations.commitConfigure(result.draft);
+		expect(committed).toMatchObject({ status: "blocked_identity" });
+		if (committed.status !== "blocked_identity") throw new Error("Expected blocked identity result.");
+		expect(typeof committed.restore).toBe("function");
+		expect(typeof committed.retainCommitted).toBe("function");
+		expect(events).toEqual(["commit", "ensure", "enter-blocked", "notify"]);
 	});
 });
 
@@ -441,15 +467,16 @@ describe("notification settings selector lifecycle", () => {
 		);
 		selectNotifications(component);
 		await flush();
-		component.handleInput("\n");
-		component.handleInput("12345");
+		component.handleInput("\n"); // Configure
+		component.handleInput("\n"); // select Telegram provider
+		component.handleInput("12345"); // supplied private-chat ID -> validation path
 		component.handleInput("\n");
 		component.handleInput(TOKEN);
 		component.handleInput("\n");
-		expect(component.render(120).join("\n")).toContain("pairing discovery");
+		expect(component.render(120).join("\n")).toContain("private-chat validation");
 		component.handleInput("\t");
 		expect(pairingSignal?.aborted).toBe(true);
-		expect(component.render(120).join("\n")).not.toContain("pairing discovery");
+		expect(component.render(120).join("\n")).not.toContain("private-chat validation");
 		pairing.resolve({ status: "aborted", identity: { status: "absent" }, message: "cancelled" });
 		await flush();
 	});

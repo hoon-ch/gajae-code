@@ -64,6 +64,8 @@ export class NotificationSessionController {
 	readonly #getConfig: () => NotificationConfig;
 	readonly #env: NodeJS.ProcessEnv;
 	readonly #disabledSessions = new Set<string>();
+	/** Sessions held inactive after a post-commit foreign daemon identity race. */
+	readonly #blockedRuntimeSessions = new Set<string>();
 	#runtime: NotificationSessionRuntime<any> | undefined;
 
 	constructor(options: NotificationSessionControllerOptions) {
@@ -99,10 +101,11 @@ export class NotificationSessionController {
 		};
 	}
 
-	/** Preserve the session-local opt-out when `/new` or fork rekeys a live session. */
+	/** Preserve session-local safety state when `/new` or fork rekeys a live session. */
 	rekeySession(previousSessionId: string, nextSessionId: string): void {
 		if (previousSessionId === nextSessionId) return;
 		if (this.#disabledSessions.delete(previousSessionId)) this.#disabledSessions.add(nextSessionId);
+		if (this.#blockedRuntimeSessions.delete(previousSessionId)) this.#blockedRuntimeSessions.add(nextSessionId);
 	}
 
 	query<Context extends NotificationSessionContext>(context: Context): NotificationSessionStatus {
@@ -120,6 +123,31 @@ export class NotificationSessionController {
 		try {
 			const runtime = this.#runtime as NotificationSessionRuntime<Context> | undefined;
 			return runtime?.isRunning(binding) ? await runtime.stop(binding) : false;
+		} finally {
+			binding.unbind();
+		}
+	}
+
+	/**
+	 * Hold this session's endpoint inactive after a foreign-daemon identity race.
+	 * The block remains until an explicit same-identity reconnect or CAS restore clears it.
+	 */
+	async enterBlockedRuntime<Context extends NotificationSessionContext>(context: Context): Promise<boolean> {
+		const binding = this.bind(context);
+		try {
+			this.#blockedRuntimeSessions.add(binding.sessionId);
+			const runtime = this.#runtime as NotificationSessionRuntime<Context> | undefined;
+			return runtime?.isRunning(binding) ? await runtime.stop(binding) : false;
+		} finally {
+			binding.unbind();
+		}
+	}
+
+	/** Clear a block only after the caller has verified a safe same-identity reconnect or restore. */
+	async clearBlockedRuntime<Context extends NotificationSessionContext>(context: Context): Promise<void> {
+		const binding = this.bind(context);
+		try {
+			this.#blockedRuntimeSessions.delete(binding.sessionId);
 		} finally {
 			binding.unbind();
 		}
@@ -155,6 +183,10 @@ export class NotificationSessionController {
 			if (!runtime) return { outcome: "disabled", status };
 			const outcome = status.running ? "already" : await runtime.start(binding);
 			const current = this.#status(binding, cfg, runtime);
+			if (!current.effectiveEnabled) {
+				if (current.running) await runtime.stop(binding);
+				return { outcome: current.running ? "stopped" : "disabled", status: this.#status(binding, cfg, runtime) };
+			}
 			if ((outcome === "started" || outcome === "already") && current.running && isTelegramConfigured(cfg)) {
 				await runtime.ensureTelegramDaemon?.(binding);
 			}
@@ -175,8 +207,11 @@ export class NotificationSessionController {
 		runtime: NotificationSessionRuntime<any> | undefined,
 	): NotificationSessionStatus {
 		const locallyEnabled = !this.#disabledSessions.has(binding.sessionId);
+		const blockedRuntime = this.#blockedRuntimeSessions.has(binding.sessionId);
 		const effectiveEnabled =
-			this.#eligible && isSessionNotificationsEnabled({ cfg, env: this.#env, sessionDisabled: !locallyEnabled });
+			!blockedRuntime &&
+			this.#eligible &&
+			isSessionNotificationsEnabled({ cfg, env: this.#env, sessionDisabled: !locallyEnabled });
 		const environment =
 			this.#env.GJC_NOTIFICATIONS === "0"
 				? "off"

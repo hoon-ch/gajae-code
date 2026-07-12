@@ -1,17 +1,18 @@
 import chalk from "chalk";
 import type { CasReceipt } from "../../../src/config/atomic-yaml-patch";
-import {
-	type NotificationsConfigureCommitResult,
-	type NotificationsEditorOperations,
-	type NotificationsEditorPreferences,
-	type NotificationsEditorSetupInput,
-	type NotificationsEditorState,
-	type NotificationsMutationResult,
-	type NotificationsPreflightResult,
-	type NotificationsSaveInactiveResult,
-	NotificationsSettingsEditorComponent,
-	type PreparedTelegramConfiguration,
+import { Settings } from "../../../src/config/settings";
+import type {
+	NotificationsConfigureCommitResult,
+	NotificationsEditorOperations,
+	NotificationsEditorPreferences,
+	NotificationsEditorSetupInput,
+	NotificationsEditorState,
+	NotificationsMutationResult,
+	NotificationsPreflightResult,
+	NotificationsSaveInactiveResult,
+	PreparedTelegramConfiguration,
 } from "../../../src/modes/components/notifications-settings-editor";
+import { SettingsSelectorComponent } from "../../../src/modes/components/settings-selector";
 import { initTheme } from "../../../src/modes/theme/theme";
 import type { TelegramDaemonReconnectOutcome } from "../../../src/notifications/notification-orchestration";
 import type {
@@ -28,9 +29,9 @@ import type {
 /**
  * Deterministic state contract for the Notifications settings visual-QA showcase.
  *
- * The renderer below injects only in-memory operations and a fixed clock into the
- * live NotificationsSettingsEditorComponent. It performs no network or fixture
- * filesystem I/O.
+ * The renderer drives the live SettingsSelectorComponent to its Notifications tab
+ * using only in-memory operations and a fixed clock. It performs no network or
+ * fixture filesystem I/O.
  */
 
 export const NOTIFICATIONS_SETTINGS_SHOWCASE_STATE_IDS = [
@@ -98,9 +99,9 @@ export interface NotificationsSettingsShowcaseEntry {
 export interface NotificationsSettingsShowcaseRender {
 	terminalText: string;
 	terminalAnsiText: string;
-	captureMode: "live-editor";
+	captureMode: "live-settings-selector";
 	state: NotificationsEditorState;
-	mode: string;
+	selectorTab: "notifications";
 	navigation: readonly string[];
 	fixedClockTimestamp: string;
 }
@@ -669,7 +670,7 @@ class DeterministicNotificationsEditorOperations implements NotificationsEditorO
 		_signal: AbortSignal,
 	): Promise<NotificationsPreflightResult> {
 		void input.token.consume();
-		if (this.stateId === "setup-pairing" || this.stateId === "cancellation") {
+		if (this.stateId === "setup-pairing" || this.stateId === "setup-validating" || this.stateId === "cancellation") {
 			return await unresolved<NotificationsPreflightResult>();
 		}
 		const foreign = this.stateId === "setup-threaded-warning";
@@ -680,7 +681,7 @@ class DeterministicNotificationsEditorOperations implements NotificationsEditorO
 				? "Threaded Mode needs review before this Telegram setup can be saved."
 				: "Telegram destination is ready for review.",
 			draft: {
-				chatId: input.chatId,
+				chatId: input.chatId ?? "1001",
 				tokenMask: "••••••••",
 				tokenFingerprint: "telegram:2050feed",
 				richEnabled: input.richEnabled,
@@ -764,24 +765,40 @@ async function settleEditor(): Promise<void> {
 	for (let index = 0; index < 8; index += 1) await Promise.resolve();
 }
 
-function selectAction(component: NotificationsSettingsEditorComponent, index: number): void {
+function selectAction(component: SettingsSelectorComponent, index: number): void {
 	for (let count = 0; count < index; count += 1) component.handleInput("\x1b[B");
 }
 
-function enterTelegramSetup(component: NotificationsSettingsEditorComponent): void {
+function selectNotifications(component: SettingsSelectorComponent): void {
+	for (let index = 0; index < 9; index += 1) component.handleInput("\t");
+}
+
+function enterTelegramSetup(component: SettingsSelectorComponent): void {
 	component.handleInput("\n");
-	component.handleInput("1001");
 	component.handleInput("\n");
 }
 
-function startPairing(component: NotificationsSettingsEditorComponent): void {
+function enterTokenEntry(component: SettingsSelectorComponent): void {
 	enterTelegramSetup(component);
+	component.handleInput("\n");
+}
+
+function startPairingDiscovery(component: SettingsSelectorComponent): void {
+	enterTokenEntry(component);
+	component.handleInput(SHOWCASE_TOKEN);
+	component.handleInput("\n");
+}
+
+function startPrivateChatValidation(component: SettingsSelectorComponent): void {
+	enterTelegramSetup(component);
+	component.handleInput("1001");
+	component.handleInput("\n");
 	component.handleInput(SHOWCASE_TOKEN);
 	component.handleInput("\n");
 }
 
 async function navigateToState(
-	component: NotificationsSettingsEditorComponent,
+	component: SettingsSelectorComponent,
 	stateId: NotificationsSettingsShowcaseStateId,
 ): Promise<readonly string[]> {
 	switch (stateId) {
@@ -789,26 +806,44 @@ async function navigateToState(
 			component.handleInput("\n");
 			return ["home:Configure Telegram"];
 		case "setup-token-entry":
-			enterTelegramSetup(component);
-			return ["home:Configure Telegram", "chat-entry:private chat ID"];
+			enterTokenEntry(component);
+			return ["home:Configure Telegram", "provider-selection:Telegram", "chat-entry:private chat ID (blank)"];
 		case "setup-validating":
-			enterTelegramSetup(component);
-			component.handleInput(SHOWCASE_TOKEN);
-			return ["home:Configure Telegram", "chat-entry:private chat ID", "token-entry:masked token"];
+			startPrivateChatValidation(component);
+			return [
+				"home:Configure Telegram",
+				"provider-selection:Telegram",
+				"chat-entry:private chat ID",
+				"token-entry:masked token",
+				"pairing:private-chat validation",
+			];
 		case "setup-threaded-warning":
 		case "setup-review":
-			startPairing(component);
+			startPairingDiscovery(component);
 			await settleEditor();
-			return ["home:Configure Telegram", "chat-entry:private chat ID", "token-entry:masked token", "review"];
+			return [
+				"home:Configure Telegram",
+				"provider-selection:Telegram",
+				"chat-entry:private chat ID",
+				"token-entry:masked token",
+				"review",
+			];
 		case "setup-pairing":
-			startPairing(component);
-			return ["home:Configure Telegram", "chat-entry:private chat ID", "token-entry:masked token", "pairing"];
+			startPairingDiscovery(component);
+			return [
+				"home:Configure Telegram",
+				"provider-selection:Telegram",
+				"chat-entry:private chat ID (blank)",
+				"token-entry:masked token",
+				"pairing:discovery",
+			];
 		case "saving":
-			startPairing(component);
+			startPairingDiscovery(component);
 			await settleEditor();
 			component.handleInput("\n");
 			return [
 				"home:Configure Telegram",
+				"provider-selection:Telegram",
 				"chat-entry:private chat ID",
 				"token-entry:masked token",
 				"review:Save configuration",
@@ -863,9 +898,15 @@ async function navigateToState(
 			await settleEditor();
 			return ["home:Reconnect Telegram runtime"];
 		case "cancellation":
-			startPairing(component);
+			startPairingDiscovery(component);
 			component.handleInput("\x1b");
-			return ["home:Configure Telegram", "chat-entry:private chat ID", "token-entry:masked token", "pairing:Escape"];
+			return [
+				"home:Configure Telegram",
+				"provider-selection:Telegram",
+				"chat-entry:private chat ID (blank)",
+				"token-entry:masked token",
+				"pairing:Escape",
+			];
 		default:
 			return ["home"];
 	}
@@ -890,26 +931,56 @@ async function configureDeterministicTheme(renderMode: NotificationsSettingsShow
 	};
 }
 
+function renderTerminalSurface(
+	component: SettingsSelectorComponent,
+	viewport: NotificationsSettingsShowcaseViewport,
+): string {
+	const lines = component.render(viewport.columns);
+	const tabLines = component.children[1]?.render(viewport.columns).length ?? 0;
+	const contentStart = 1 + tabLines + 1;
+	const minimumFrameRows = contentStart + 14 + 1;
+	const paddingBeforeClosingBorder = Math.max(0, minimumFrameRows - lines.length);
+	if (paddingBeforeClosingBorder > 0) {
+		lines.splice(Math.max(0, lines.length - 1), 0, ...Array.from({ length: paddingBeforeClosingBorder }, () => ""));
+	}
+	if (lines.length > viewport.rows) {
+		throw new Error(`Notifications selector exceeds ${viewport.id}: rendered ${lines.length} rows`);
+	}
+	while (lines.length < viewport.rows) lines.push("");
+	return `${lines.join("\n")}\n`;
+}
+
 export async function renderNotificationsSettingsShowcase(
 	entry: NotificationsSettingsShowcaseEntry,
 ): Promise<NotificationsSettingsShowcaseRender> {
 	showcaseState(entry.stateId);
 	const restoreChalk = await configureDeterministicTheme(entry.renderMode);
-	let component: NotificationsSettingsEditorComponent | undefined;
+	let component: SettingsSelectorComponent | undefined;
 	try {
+		await Settings.init({ inMemory: true });
 		const operations = new DeterministicNotificationsEditorOperations(entry.stateId, SHOWCASE_CLOCK);
-		component = new NotificationsSettingsEditorComponent(operations);
-		component.focused = true;
+		component = new SettingsSelectorComponent(
+			{
+				availableThinkingLevels: [],
+				thinkingLevel: undefined,
+				availableThemes: ["red-claw"],
+				availableModelProfiles: [],
+				cwd: "/showcase",
+			},
+			{ onChange: () => {}, onCancel: () => {} },
+			operations,
+		);
+		selectNotifications(component);
 		await settleEditor();
 		const navigation = await navigateToState(component, entry.stateId);
-		const rendered = `${component.render(entry.viewport.columns).join("\n")}\n`;
+		const rendered = renderTerminalSurface(component, entry.viewport);
 		const terminalAnsiText = entry.renderMode === "ascii-no-color" ? Bun.stripANSI(rendered) : rendered;
 		return {
 			terminalText: Bun.stripANSI(terminalAnsiText),
 			terminalAnsiText,
-			captureMode: "live-editor",
+			captureMode: "live-settings-selector",
 			state: operations.snapshot,
-			mode: component.mode,
+			selectorTab: "notifications",
 			navigation,
 			fixedClockTimestamp: new Date(SHOWCASE_CLOCK.now()).toISOString(),
 		};

@@ -11,6 +11,7 @@ import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand, parseRichToggleCommand, parseTelegramControlCommand } from "./config-commands";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
+import { sanitizeDiagnostic } from "./notification-service";
 import { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
 
 export { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
@@ -899,7 +900,7 @@ export class TelegramUpdatePoller {
 			// A cooperative stop aborts the in-flight long poll; treat as a clean wake.
 			if (isAbortError(err)) return 0;
 			// A transient Telegram API failure must never crash the daemon.
-			logger.error("notifications daemon: getUpdates failed", { error: String(err) });
+			logger.error("notifications daemon: getUpdates failed", { error: sanitizeDiagnostic(String(err)) });
 			await this.#opts.runtime.sleep(POLL_BACKOFF_MS, signal);
 			return 0;
 		}

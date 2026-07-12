@@ -331,7 +331,13 @@ Slack socket-mode app — the contract above is all you implement.
 
 ## Managed notification adapters
 
-For the exact user setup flow (`gjc notify setup`, BotFather token, private-chat pairing, status, and troubleshooting), see [Telegram notification onboarding](./telegram-onboarding.md).
+For interactive Telegram setup, open `/settings` → **Notifications** in a
+running GJC session. The same tab exposes configuration, global enable/disable,
+current-session on/off, health, test, recovery, reconnect, and adapter-local
+Telegram removal. For headless setup and automation, `gjc notify
+setup|status|health|test|recovery` remains authoritative; see [Telegram
+notification onboarding](./telegram-onboarding.md) for pairing and
+troubleshooting.
 
 ## Managed Telegram daemon (bundled reference client)
 
@@ -347,29 +353,42 @@ and Slack adapters are thin presentation layers: they render internal notificati
 events into transport payloads and map transport interactions back to `{sessionId,
 actionId,answer}` replies.
 
-### Setup and auto-connect
+### Setup, settings, and auto-connect
 
-Run the setup command once:
+The recommended interactive path is `/settings` → **Notifications**. It keeps
+Telegram token entry masked; after entry the token is never prefilled or rendered
+again. Configure or reconfigure Telegram there, and use the same tab for global
+enable/disable, current-session on/off, health/probe, test, recovery, reconnect,
+or adapter-local Telegram removal.
 
-```sh
-gjc notify setup
-```
+`gjc notify setup` remains the authoritative CLI fallback for headless and
+automated provisioning. With `--token <botToken> --chat-id <chatId>`, it can save
+a known private-chat pair without prompts. The CLI operational fallback is `gjc
+notify status`, `gjc notify health`, `gjc notify test`, and `gjc notify recovery`.
 
-The wizard validates the bot token with Telegram, verifies private-chat Threaded
-Mode capability via `getMe.has_topics_enabled`, waits for a private DM to the bot,
-and writes canonical global Settings under `config.yml` in the GJC agent
-directory. It enables:
+Notification identity is global-only: the global GJC agent configuration provides
+all `notifications.*` values with schema defaults. Project notification keys are
+ignored and runtime notification overrides are rejected, so neither can supply or
+shadow outbound credentials. A complete global configuration is enabled plus one
+complete adapter: Telegram token/private-chat pair, Discord token/channel pair,
+or Slack token/channel pair.
+Runtime proceeds through three distinct gates: an eligible host receives the
+control surface, an effectively enabled session starts the generic endpoint, and
+only a complete global Telegram configuration ensures the Telegram daemon.
+`GJC_NOTIFY=off`, `0`, or `false` blocks the host control surface;
+`GJC_NOTIFICATIONS=0` is the runtime hard-off. `GJC_NOTIFICATIONS=1` or
+`GJC_NOTIFICATIONS_TOKEN` explicitly enables the generic session path; it can
+opt in a GJC-spawned `notifications.sessionScope=primary` child but cannot
+override a hard-off or helper/subagent exclusion. Discord-only, Slack-only, and
+environment-only sessions do not start the Telegram daemon.
 
-- `notifications.enabled`
-- `notifications.telegram.botToken`
-- `notifications.telegram.chatId`
-- `notifications.redact` (optional; default false)
-- `notifications.discord.botToken` / `notifications.discord.channelId` (optional Discord adapter)
-- `notifications.slack.botToken` / `notifications.slack.channelId` (optional Slack adapter)
 
-After setup, sessions auto-connect when notifications are enabled. Each session
-still publishes its own loopback endpoint; the daemon is only the Telegram-side
-multiplexer.
+Removing Telegram from the tab unsets only Telegram credentials. It preserves
+complete Discord or Slack adapters and global enablement; global notifications are
+disabled only when Telegram was the final complete adapter. After a global setup,
+sessions auto-connect when their local and environment gates allow it. Each
+session still publishes its own loopback endpoint; the daemon is only the
+Telegram-side multiplexer.
 
 For Telegram forum topics, the daemon deletes the per-session topic when the local
 notification endpoint shuts down, so it disappears from the topic list. A resumed
@@ -396,6 +415,16 @@ managed daemon enforces **one bot token = one getUpdates poller** with a local
 lock/state file under the agent directory. New sessions attach to the existing
 fresh daemon owner instead of starting another poller, preventing Telegram 409
 conflicts.
+
+A fresh same-token owner is reused rather than polled against. If its paired chat
+is stored, setup validates without `getUpdates`; if the chat is missing or
+changed, an explicitly validated private chat id is required and GJC still does
+not poll. A foreign or unknown owner is never killed, reloaded, or taken over:
+setup defaults to cancellation before writing. A Telegram-only foreign setup can
+be saved inactive only by explicit choice; that option is unavailable when a
+complete Discord or Slack adapter would be globally disabled. If a post-save race
+blocks Telegram activation, GJC stops the current endpoint before reporting the
+block and leaves the foreign owner untouched.
 
 The trust model is intentionally strict:
 
@@ -488,14 +517,24 @@ redaction is disabled, all content is delivered unchanged.
 
 ### Local `/notify`
 
-Inside a GJC session, `/notify` controls the current session only:
+Inside a GJC session, `/notify` controls the current session only; it never
+changes global settings or credentials:
 
 - `/notify status` reports enabled/disabled state, daemon observation when known,
   and redaction state without printing secrets;
 - `/notify off` disables the current session's notification endpoint and removes
   its discovery record without mutating global Settings;
-- `/notify on` re-enables the current session when global setup is complete and
-  `GJC_NOTIFICATIONS=0` is not forcing opt-out.
+- `/notify on` re-enables the current session when a complete global setup or
+  explicit environment path is available, unless `GJC_NOTIFICATIONS=0` is
+  forcing opt-out.
+
+`GJC_NOTIFY=off`, `0`, or `false` prevents the process notification control
+surface. For the eligible session runtime, precedence is: `GJC_NOTIFICATIONS=0`
+hard-off, then local `/notify off`, then `GJC_NOTIFICATIONS=1` or
+`GJC_NOTIFICATIONS_TOKEN`, then complete global configuration. GJC-spawned
+children with `notifications.sessionScope=primary` are suppressed unless the
+explicit environment path opts them in; helper/subagent exclusions and hard-offs
+still win.
 
 ### Manual Telegram CLI is for debugging
 

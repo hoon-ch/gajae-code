@@ -6,13 +6,13 @@ import {
 	NOTIFICATIONS_SETTINGS_SHOWCASE_STATE_IDS,
 	NOTIFICATIONS_SETTINGS_SHOWCASE_VIEWPORTS,
 	type NotificationsSettingsShowcaseEntry,
-	renderNotificationsSettingsShowcasePlaceholder,
+	renderNotificationsSettingsShowcase,
 } from "../test/fixtures/tui/notifications-settings-showcase";
 
 const CANONICAL_COMMAND =
 	"bun packages/coding-agent/scripts/capture-notifications-settings-showcase.ts --output .gjc/qa/issue-2050-notifications";
 const DETERMINISTIC_CAPTURE_TIMESTAMP = "1970-01-01T00:00:00.000Z";
-const CAPTURE_TOOL_VERSION = "notifications-settings-showcase-scaffold-v1";
+const CAPTURE_TOOL_VERSION = "notifications-settings-showcase-live-editor-v1";
 
 interface ArtifactFile {
 	path: string;
@@ -29,8 +29,29 @@ interface ManifestEntry {
 		rows: number;
 	};
 	render_mode: string;
-	capture_mode: "fixture-placeholder";
+	capture_mode: "live-editor";
 	files: ArtifactFile[];
+}
+
+interface IndependentReviewReceipt {
+	schema_version: 1;
+	reviewer: string | null;
+	reviewer_role: string | null;
+	reviewed_commit: string | null;
+	design_sha256: string | null;
+	manifest_sha256: string;
+	expected_manifest_entries: number;
+	reviewed_manifest_entries: number | null;
+	cjk_cases: Array<{
+		state_id: string;
+		viewport: string;
+		render_mode: string;
+		result: "pending";
+		notes: string;
+	}>;
+	findings: string[];
+	verdict: "pending";
+	reviewed_at: string | null;
 }
 
 function usage(): never {
@@ -54,56 +75,136 @@ function escapeHtml(text: string): string {
 	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-/** Render the limited deterministic SGR palette emitted by the placeholder. */
+type AnsiStyle = {
+	foreground?: string;
+	background?: string;
+	bold?: boolean;
+	dim?: boolean;
+	italic?: boolean;
+	underline?: boolean;
+	inverse?: boolean;
+};
+
+const ANSI_COLORS: Record<number, string> = {
+	30: "#000000",
+	31: "#cc0000",
+	32: "#4e9a06",
+	33: "#c4a000",
+	34: "#3465a4",
+	35: "#75507b",
+	36: "#06989a",
+	37: "#d3d7cf",
+	90: "#555753",
+	91: "#ef2929",
+	92: "#8ae234",
+	93: "#fce94f",
+	94: "#729fcf",
+	95: "#ad7fa8",
+	96: "#34e2e2",
+	97: "#eeeeec",
+};
+
+function ansi256Color(index: number): string {
+	if (index < 16) return ANSI_COLORS[index < 8 ? index + 30 : index + 82] ?? "#ffffff";
+	if (index >= 232) {
+		const value = (index - 232) * 10 + 8;
+		return `rgb(${value},${value},${value})`;
+	}
+	const value = index - 16;
+	const red = Math.floor(value / 36);
+	const green = Math.floor((value % 36) / 6);
+	const blue = value % 6;
+	const channel = (component: number) => (component === 0 ? 0 : component * 40 + 55);
+	return `rgb(${channel(red)},${channel(green)},${channel(blue)})`;
+}
+
+function styleAttribute(style: AnsiStyle): string {
+	const declarations: string[] = [];
+	if (style.foreground) declarations.push(`color:${style.foreground}`);
+	if (style.background) declarations.push(`background-color:${style.background}`);
+	if (style.bold) declarations.push("font-weight:700");
+	if (style.dim) declarations.push("opacity:.65");
+	if (style.italic) declarations.push("font-style:italic");
+	if (style.underline) declarations.push("text-decoration:underline");
+	if (style.inverse) declarations.push("filter:invert(1)");
+	return declarations.join(";");
+}
+
+const NON_VISUAL_TERMINAL_CONTROL = /\x1b_[^\x1b\x07]*(?:\x07|\x1b\\)/g;
+
+/** Render the SGR styles emitted by the live editor without retaining raw control codes in HTML. */
 function ansiToHtml(text: string): string {
+	const visibleText = text.replace(NON_VISUAL_TERMINAL_CONTROL, "");
 	const sgr = /\x1b\[([0-9;]*)m/g;
 	let html = "";
 	let offset = 0;
-	let open = false;
-	let styles: string[] = [];
-
+	let spanOpen = false;
+	let style: AnsiStyle = {};
 	const close = () => {
-		if (open) {
-			html += "</span>";
-			open = false;
-		}
+		if (!spanOpen) return;
+		html += "</span>";
+		spanOpen = false;
 	};
-	const openCurrent = () => {
-		if (styles.length > 0) {
-			html += `<span style="${styles.join(";")}">`;
-			open = true;
-		}
+	const open = () => {
+		const attribute = styleAttribute(style);
+		if (!attribute) return;
+		html += `<span style="${attribute}">`;
+		spanOpen = true;
 	};
 
-	for (const match of text.matchAll(sgr)) {
-		html += escapeHtml(text.slice(offset, match.index));
+	for (const match of visibleText.matchAll(sgr)) {
+		html += escapeHtml(visibleText.slice(offset, match.index));
 		offset = (match.index ?? 0) + match[0].length;
 		close();
 		const codes = (match[1] || "0").split(";").map(Number);
-		for (const code of codes) {
-			if (code === 0) {
-				styles = [];
-			} else if (code === 1 && !styles.includes("font-weight:700")) {
-				styles.push("font-weight:700");
-			} else if (code === 33) {
-				styles = styles.filter(style => !style.startsWith("color:"));
-				styles.push("color:#b58900");
-			} else if (code === 36) {
-				styles = styles.filter(style => !style.startsWith("color:"));
-				styles.push("color:#008b8b");
+		for (let index = 0; index < codes.length; index += 1) {
+			const code = codes[index];
+			if (code === 0) style = {};
+			else if (code === 1) style.bold = true;
+			else if (code === 2) style.dim = true;
+			else if (code === 3) style.italic = true;
+			else if (code === 4) style.underline = true;
+			else if (code === 7) style.inverse = true;
+			else if (code === 22) {
+				style.bold = false;
+				style.dim = false;
+			} else if (code === 23) style.italic = false;
+			else if (code === 24) style.underline = false;
+			else if (code === 27) style.inverse = false;
+			else if (code === 39) style.foreground = undefined;
+			else if (code === 49) style.background = undefined;
+			else if (code in ANSI_COLORS) style.foreground = ANSI_COLORS[code];
+			else if (code >= 40 && code <= 47) style.background = ANSI_COLORS[code - 10];
+			else if (code >= 100 && code <= 107) style.background = ANSI_COLORS[code - 10];
+			else if (code === 38 || code === 48) {
+				const colorMode = codes[index + 1];
+				if (colorMode === 2) {
+					const red = codes[index + 2];
+					const green = codes[index + 3];
+					const blue = codes[index + 4];
+					if ([red, green, blue].every(Number.isInteger)) {
+						if (code === 38) style.foreground = `rgb(${red},${green},${blue})`;
+						else style.background = `rgb(${red},${green},${blue})`;
+					}
+					index += 4;
+				} else if (colorMode === 5 && Number.isInteger(codes[index + 2])) {
+					if (code === 38) style.foreground = ansi256Color(codes[index + 2]!);
+					else style.background = ansi256Color(codes[index + 2]!);
+					index += 2;
+				}
 			}
 		}
-		openCurrent();
+		open();
 	}
 	close();
-	html += escapeHtml(text.slice(offset));
+	html += escapeHtml(visibleText.slice(offset));
 	return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="color-scheme" content="dark">
 <title>Notifications settings showcase</title>
-<style>body{margin:0;background:#111;color:#eee}pre{margin:0;padding:1em;white-space:pre-wrap;font-family:ui-monospace,monospace;line-height:1.2}</style>
+<style>body{margin:0;background:#110b0b;color:#ffe7dc}pre{margin:0;padding:1em;white-space:pre-wrap;font-family:ui-monospace,monospace;line-height:1.2}</style>
 </head>
 <body><pre>${html}</pre></body>
 </html>
@@ -153,7 +254,7 @@ async function writeArtifact(filePath: string, content: string, outputRoot: stri
 }
 
 async function captureEntry(entry: NotificationsSettingsShowcaseEntry, outputRoot: string): Promise<ManifestEntry> {
-	const rendered = renderNotificationsSettingsShowcasePlaceholder(entry);
+	const rendered = await renderNotificationsSettingsShowcase(entry);
 	const entryDirectory = path.join(outputRoot, entry.stateId, entry.viewport.id, entry.renderMode);
 	await fs.mkdir(entryDirectory, { recursive: true });
 
@@ -164,7 +265,7 @@ async function captureEntry(entry: NotificationsSettingsShowcaseEntry, outputRoo
 		state_id: entry.stateId,
 		viewport: entry.viewport,
 		render_mode: entry.renderMode,
-		capture_mode: "fixture-placeholder",
+		capture_mode: rendered.captureMode,
 		capture_timestamp: DETERMINISTIC_CAPTURE_TIMESTAMP,
 		command_or_replay_source: CANONICAL_COMMAND,
 		fixture_source: "packages/coding-agent/test/fixtures/tui/notifications-settings-showcase.ts",
@@ -173,16 +274,19 @@ async function captureEntry(entry: NotificationsSettingsShowcaseEntry, outputRoo
 			columns: entry.viewport.columns,
 			rows: entry.viewport.rows,
 			font_rendering_assumptions:
-				"Fixture placeholder rendered as monospace HTML; live PTY/font capture is pending Work item 7.",
+				"Embedded red-claw theme at deterministic truecolor; HTML uses a monospace terminal fallback stack.",
 			wrapping_policy:
-				"Placeholder preserves semantic localized sentences; Work item 7 must capture the editor's ANSI-aware cell wrapping.",
+				"NotificationsSettingsEditorComponent.render(width) uses ANSI-aware cell truncation and wrapping at the declared viewport width.",
 			ansi_control_semantics:
-				"terminal-ansi.txt preserves emitted SGR sequences; no cursor-position control sequences are emitted by the scaffold.",
+				"terminal-ansi.txt preserves emitted SGR sequences; terminal.txt and ascii-no-color captures strip them.",
 		},
 		editor_render: {
-			status: "pending-work-item-7",
-			placeholder: rendered.placeholder,
-			note: "This artifact proves the 88-entry capture contract only. It is not live editor visual-QA evidence.",
+			component: "NotificationsSettingsEditorComponent",
+			operations: "deterministic in-memory NotificationsEditorOperations fake",
+			fixed_clock_timestamp: rendered.fixedClockTimestamp,
+			mode: rendered.mode,
+			navigation: rendered.navigation,
+			state: rendered.state,
 		},
 	});
 
@@ -198,8 +302,31 @@ async function captureEntry(entry: NotificationsSettingsShowcaseEntry, outputRoo
 		state_id: entry.stateId,
 		viewport: entry.viewport,
 		render_mode: entry.renderMode,
-		capture_mode: "fixture-placeholder",
+		capture_mode: rendered.captureMode,
 		files,
+	};
+}
+
+function pendingIndependentReview(manifestSha256: string): IndependentReviewReceipt {
+	return {
+		schema_version: 1,
+		reviewer: null,
+		reviewer_role: null,
+		reviewed_commit: null,
+		design_sha256: null,
+		manifest_sha256: manifestSha256,
+		expected_manifest_entries: NOTIFICATIONS_SETTINGS_SHOWCASE_EXPECTED_ENTRY_COUNT,
+		reviewed_manifest_entries: null,
+		cjk_cases: NOTIFICATIONS_SETTINGS_SHOWCASE_STATE_IDS.map(stateId => ({
+			state_id: stateId,
+			viewport: "160x48",
+			render_mode: "unicode-color",
+			result: "pending",
+			notes: "Awaiting independent visual review.",
+		})),
+		findings: ["Independent review is required before this capture set is accepted as visual-QA evidence."],
+		verdict: "pending",
+		reviewed_at: null,
 	};
 }
 
@@ -216,7 +343,7 @@ async function main(): Promise<void> {
 	const manifest = json({
 		schema_version: 1,
 		capture_tool: CAPTURE_TOOL_VERSION,
-		capture_mode: "fixture-placeholder",
+		capture_mode: "live-editor",
 		command: CANONICAL_COMMAND,
 		expected_entry_count: NOTIFICATIONS_SETTINGS_SHOWCASE_EXPECTED_ENTRY_COUNT,
 		entry_count: entries.length,
@@ -228,10 +355,12 @@ async function main(): Promise<void> {
 		},
 		entries,
 	});
+	const manifestSha256 = sha256(manifest);
 	await Bun.write(path.join(outputRoot, "manifest.json"), manifest);
+	await Bun.write(path.join(outputRoot, "independent-review.json"), json(pendingIndependentReview(manifestSha256)));
 
 	process.stdout.write(
-		`Captured ${entries.length} deterministic Notifications showcase scaffold entries to ${outputRoot}\nmanifest.json sha256: ${sha256(manifest)}\n`,
+		`Captured ${entries.length} deterministic Notifications live-editor showcase entries to ${outputRoot}\nmanifest.json sha256: ${manifestSha256}\n`,
 	);
 }
 

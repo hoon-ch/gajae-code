@@ -382,6 +382,11 @@ async function runRecovery(deps: NotifyCommandDeps): Promise<void> {
 export function printNotifyHelp(): void {
 	process.stdout.write(`${chalk.bold(`${APP_NAME} notify`)} - Configure Telegram notifications
 
+${chalk.bold("Interactive path:")}
+  In a running GJC session, use /settings → Notifications for setup, health, test, recovery,
+  reconnect, global enable/disable, adapter-local Telegram removal, and session on/off.
+  The CLI subcommands below remain the authoritative headless and automation fallback.
+
 ${chalk.bold("Usage:")}
   ${APP_NAME} notify setup
   ${APP_NAME} notify setup --token <botToken> --chat-id <chatId> [--redact]

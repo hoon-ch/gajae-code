@@ -47,6 +47,7 @@
 							"properties": {
 								"enabled": {
 									"type": "boolean",
+									"description": "Format Telegram notifications with rich message content.",
 									"default": true
 								}
 							},
@@ -57,6 +58,7 @@
 							"properties": {
 								"enabled": {
 									"type": "boolean",
+									"description": "Include rich draft updates in Telegram notifications.",
 									"default": false
 								}
 							},
@@ -100,14 +102,17 @@
 				},
 				"redact": {
 					"type": "boolean",
+					"description": "Redact sensitive content before notifications are delivered.",
 					"default": false
 				},
 				"verbosity": {
 					"type": "string",
+					"description": "Choose concise or detailed notification messages.",
 					"default": "lean"
 				},
 				"sessionScope": {
 					"type": "string",
+					"description": "Send notifications from all sessions or only the primary session.",
 					"default": "all"
 				},
 				"daemon": {

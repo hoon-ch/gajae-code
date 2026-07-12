@@ -1,10 +1,36 @@
+import chalk from "chalk";
+import type { CasReceipt } from "../../../src/config/atomic-yaml-patch";
+import {
+	type NotificationsConfigureCommitResult,
+	type NotificationsEditorOperations,
+	type NotificationsEditorPreferences,
+	type NotificationsEditorSetupInput,
+	type NotificationsEditorState,
+	type NotificationsMutationResult,
+	type NotificationsPreflightResult,
+	type NotificationsSaveInactiveResult,
+	NotificationsSettingsEditorComponent,
+	type PreparedTelegramConfiguration,
+} from "../../../src/modes/components/notifications-settings-editor";
+import { initTheme } from "../../../src/modes/theme/theme";
+import type { TelegramDaemonReconnectOutcome } from "../../../src/notifications/notification-orchestration";
+import type {
+	NotificationHealthReport,
+	NotificationRecoveryReport,
+	NotificationStatusReport,
+	NotificationTestResult,
+} from "../../../src/notifications/notification-service";
+import type {
+	NotificationSessionReconcileResult,
+	NotificationSessionStatus,
+} from "../../../src/notifications/session-control";
+
 /**
  * Deterministic state contract for the Notifications settings visual-QA showcase.
  *
- * This fixture intentionally has no filesystem, network, clock, or terminal
- * dependency. Work item 7 replaces the placeholder renderer with a render of
- * NotificationsSettingsEditorComponent while retaining these state IDs,
- * viewports, render modes, and localized copy.
+ * The renderer below injects only in-memory operations and a fixed clock into the
+ * live NotificationsSettingsEditorComponent. It performs no network or fixture
+ * filesystem I/O.
  */
 
 export const NOTIFICATIONS_SETTINGS_SHOWCASE_STATE_IDS = [
@@ -72,7 +98,11 @@ export interface NotificationsSettingsShowcaseEntry {
 export interface NotificationsSettingsShowcaseRender {
 	terminalText: string;
 	terminalAnsiText: string;
-	placeholder: boolean;
+	captureMode: "live-editor";
+	state: NotificationsEditorState;
+	mode: string;
+	navigation: readonly string[];
+	fixedClockTimestamp: string;
 }
 
 export const NOTIFICATIONS_SETTINGS_SHOWCASE_STATES: readonly NotificationsSettingsShowcaseState[] = [
@@ -395,43 +425,496 @@ export const NOTIFICATIONS_SETTINGS_SHOWCASE_ENTRIES: readonly NotificationsSett
 
 export const NOTIFICATIONS_SETTINGS_SHOWCASE_EXPECTED_ENTRY_COUNT = 88;
 
-/**
- * TODO(WI7): Replace this with the actual NotificationsSettingsEditorComponent
- * render. Keep the fixture deterministic, preserve the public state matrix,
- * and return both plain and ANSI-preserving terminal output.
- */
-export function renderNotificationsSettingsShowcasePlaceholder(
-	entry: NotificationsSettingsShowcaseEntry,
-): NotificationsSettingsShowcaseRender {
-	const state = NOTIFICATIONS_SETTINGS_SHOWCASE_STATES.find(candidate => candidate.stateId === entry.stateId);
-	if (!state) throw new Error(`Unknown showcase state: ${entry.stateId}`);
+const SHOWCASE_CLOCK = {
+	now: () => 1_700_000_042_000,
+};
+const SHOWCASE_RECEIPT: CasReceipt = {
+	revisions: [],
+	restore: async () => ({ status: "discarded" }),
+	discard: () => {},
+};
+const SHOWCASE_TOKEN = `123456:${"a".repeat(24)}`;
 
-	const marker = entry.renderMode === "ascii-no-color" ? ">" : "❯";
-	const separator = entry.renderMode === "ascii-no-color" ? " - " : " · ";
-	const terminalText =
-		[
-			"Notifications settings showcase scaffold",
-			`${marker} ${state.title}`,
-			`State: ${entry.stateId}${separator}Viewport: ${entry.viewport.id}${separator}Render: ${entry.renderMode}`,
-			"",
-			`English: ${state.copy.english}`,
-			`한국어: ${state.copy.korean}`,
-			`日本語: ${state.copy.japanese}`,
-			`中文: ${state.copy.chinese}`,
-			"",
-			"TODO(WI7): replace this placeholder with the real Notifications editor render.",
-			"Fixture-only capture: no network, filesystem, credential, or live daemon access.",
-		].join("\n") + "\n";
+function showcaseState(stateId: NotificationsSettingsShowcaseStateId): NotificationsSettingsShowcaseState {
+	const state = NOTIFICATIONS_SETTINGS_SHOWCASE_STATES.find(candidate => candidate.stateId === stateId);
+	if (!state) throw new Error(`Unknown showcase state: ${stateId}`);
+	return state;
+}
 
+function configuredAdapter(channel: string): NotificationStatusReport["discord"] {
+	return { botTokenMasked: "••••••••", channel, configured: true };
+}
+
+function fixedHealth(
+	stateId: NotificationsSettingsShowcaseStateId,
+	configured: boolean,
+	level: "ok" | "warn" | "error",
+	clock: typeof SHOWCASE_CLOCK = SHOWCASE_CLOCK,
+): NotificationHealthReport {
+	const state = showcaseState(stateId);
+	const heartbeatAt = clock.now() - 42_000;
 	return {
-		terminalText,
-		terminalAnsiText:
-			entry.renderMode === "ascii-no-color"
-				? terminalText
-				: `\x1b[1;36mNotifications settings showcase scaffold\x1b[0m\n\x1b[1;33m${marker} ${state.title}\x1b[0m\n${terminalText
-						.split("\n")
-						.slice(2)
-						.join("\n")}`,
-		placeholder: true,
+		overall: level,
+		configured,
+		checks: [
+			{
+				name: "showcase",
+				level,
+				detail: `${state.copy.english} ${state.copy.korean} ${state.copy.japanese} ${state.copy.chinese}`,
+			},
+		],
+		daemon: {
+			present: configured,
+			ownerId: configured ? "showcase-daemon" : undefined,
+			pid: configured ? 2_050 : undefined,
+			alive: configured,
+			heartbeatFresh: level === "ok",
+			identityMatches: level !== "error",
+			stopped: stateId === "foreign-blocked",
+			heartbeatAt: configured ? heartbeatAt : undefined,
+			heartbeatAgeMs: configured ? clock.now() - heartbeatAt : undefined,
+			generation: configured ? 7 : undefined,
+			currentGeneration: 7,
+			generationRelation: configured ? "current" : "unknown",
+		},
+		endpoints: {
+			total: configured ? 3 : 0,
+			live: configured && level !== "error" ? 2 : 0,
+			dead: configured && level === "error" ? 1 : 0,
+			unknown: configured ? 1 : 0,
+			unreadable: 0,
+		},
+		reachability: {
+			probed: stateId === "health-ok",
+			ok: level === "ok",
+			detail: level === "ok" ? "reachable" : level === "warn" ? "recovery is available" : "foreign owner blocked",
+		},
 	};
+}
+
+function fixedEditorState(
+	stateId: NotificationsSettingsShowcaseStateId,
+	clock: typeof SHOWCASE_CLOCK = SHOWCASE_CLOCK,
+): NotificationsEditorState {
+	const status: NotificationStatusReport = {
+		enabled: true,
+		redact: false,
+		verbosity: "lean",
+		globallyConfigured: true,
+		telegram: {
+			botTokenMasked: "••••••••",
+			channel: "1001",
+			configured: true,
+			tokenFingerprint: "telegram:2050feed",
+		},
+		discord: { botTokenMasked: "(not set)", channel: undefined, configured: false },
+		slack: { botTokenMasked: "(not set)", channel: undefined, configured: false },
+	};
+	let session: NotificationSessionStatus = {
+		eligible: true,
+		locallyEnabled: true,
+		effectiveEnabled: true,
+		running: true,
+		environment: "default",
+	};
+	const preferences: NotificationsEditorPreferences = {
+		redact: false,
+		verbosity: "lean",
+		sessionScope: "all",
+		richEnabled: true,
+		richDraftEnabled: false,
+	};
+
+	switch (stateId) {
+		case "home-unconfigured":
+		case "setup-provider":
+		case "setup-token-entry":
+		case "setup-validating":
+		case "setup-threaded-warning":
+		case "setup-pairing":
+		case "setup-review":
+		case "saving":
+		case "cancellation":
+			status.enabled = false;
+			status.globallyConfigured = false;
+			status.telegram = {
+				botTokenMasked: "(not set)",
+				channel: undefined,
+				configured: false,
+				tokenFingerprint: undefined,
+			};
+			session = { ...session, locallyEnabled: false, effectiveEnabled: false, running: false };
+			break;
+		case "home-configured-inactive":
+			status.enabled = false;
+			session = { ...session, locallyEnabled: false, effectiveEnabled: false, running: false };
+			break;
+		case "home-local-off":
+			session = { ...session, locallyEnabled: false, effectiveEnabled: false, running: false };
+			break;
+		case "home-env-off":
+			session = {
+				eligible: false,
+				locallyEnabled: false,
+				effectiveEnabled: false,
+				running: false,
+				environment: "off",
+			};
+			break;
+		case "home-env-on":
+			status.enabled = false;
+			status.globallyConfigured = false;
+			status.telegram = {
+				botTokenMasked: "(not set)",
+				channel: undefined,
+				configured: false,
+				tokenFingerprint: undefined,
+			};
+			session = { ...session, environment: "explicit" };
+			break;
+		case "home-discord-only":
+			status.telegram = {
+				botTokenMasked: "(not set)",
+				channel: undefined,
+				configured: false,
+				tokenFingerprint: undefined,
+			};
+			status.discord = configuredAdapter("discord-channel");
+			break;
+		case "home-slack-only":
+			status.telegram = {
+				botTokenMasked: "(not set)",
+				channel: undefined,
+				configured: false,
+				tokenFingerprint: undefined,
+			};
+			status.slack = configuredAdapter("slack-channel");
+			break;
+		case "foreign-blocked":
+			session = { ...session, effectiveEnabled: false, running: false };
+			break;
+		default:
+			break;
+	}
+
+	const level =
+		stateId === "health-ok" ? "ok" : stateId === "error" || stateId === "foreign-blocked" ? "error" : "warn";
+	return { status, session, preferences, health: fixedHealth(stateId, status.globallyConfigured, level, clock) };
+}
+
+function unresolved<T>(): Promise<T> {
+	return new Promise<T>(() => {});
+}
+
+class DeterministicNotificationsEditorOperations implements NotificationsEditorOperations {
+	#state: NotificationsEditorState;
+
+	constructor(
+		readonly stateId: NotificationsSettingsShowcaseStateId,
+		readonly clock: typeof SHOWCASE_CLOCK,
+	) {
+		this.#state = fixedEditorState(stateId, clock);
+	}
+
+	get snapshot(): NotificationsEditorState {
+		return structuredClone(this.#state);
+	}
+
+	async loadState(): Promise<NotificationsEditorState> {
+		return this.#state;
+	}
+
+	async refreshHealth(input: { probe: boolean; signal?: AbortSignal }): Promise<NotificationHealthReport> {
+		void input.signal;
+		if (this.stateId === "health-probing" && input.probe) return await unresolved<NotificationHealthReport>();
+		const level = this.stateId === "health-warning" ? "warn" : "ok";
+		const health = fixedHealth(this.stateId, this.#state.status.globallyConfigured, level, this.clock);
+		health.reachability = input.probe
+			? { probed: true, ok: level === "ok", detail: level === "ok" ? "reachable" : "warning" }
+			: health.reachability;
+		this.#state = { ...this.#state, health };
+		return health;
+	}
+
+	async sendTest(): Promise<NotificationTestResult> {
+		if (this.stateId === "testing" || this.stateId === "navigation-locked")
+			return await unresolved<NotificationTestResult>();
+		return {
+			ok: true,
+			adapter: "telegram",
+			chatId: this.#state.status.telegram.channel,
+			detail: "delivered to showcase chat",
+		};
+	}
+
+	async recover(): Promise<NotificationRecoveryReport> {
+		if (this.stateId === "recovering") return await unresolved<NotificationRecoveryReport>();
+		if (this.stateId === "error") throw new Error("deterministic recovery failure");
+		return {
+			endpointsScanned: 3,
+			endpointsRemoved: [],
+			endpointsKept: 3,
+			endpointsUnreadable: 0,
+			daemon: { action: "none", detail: "no dead owner", ownerId: "showcase-daemon", pid: 2_050 },
+		};
+	}
+
+	async reconnect(): Promise<TelegramDaemonReconnectOutcome> {
+		if (this.stateId === "reconnecting") return await unresolved<TelegramDaemonReconnectOutcome>();
+		return this.stateId === "foreign-blocked" ? "blocked_identity" : "attached";
+	}
+
+	async preflightProposedIdentity(
+		input: NotificationsEditorSetupInput,
+		_signal: AbortSignal,
+	): Promise<NotificationsPreflightResult> {
+		void input.token.consume();
+		if (this.stateId === "setup-pairing" || this.stateId === "cancellation") {
+			return await unresolved<NotificationsPreflightResult>();
+		}
+		const foreign = this.stateId === "setup-threaded-warning";
+		return {
+			status: "ready",
+			identity: foreign ? { status: "foreign" } : { status: "absent" },
+			message: foreign
+				? "Threaded Mode needs review before this Telegram setup can be saved."
+				: "Telegram destination is ready for review.",
+			draft: {
+				chatId: input.chatId,
+				tokenMask: "••••••••",
+				tokenFingerprint: "telegram:2050feed",
+				richEnabled: input.richEnabled,
+				richDraftEnabled: input.richDraftEnabled,
+			},
+		};
+	}
+
+	async commitConfigure(_draft: PreparedTelegramConfiguration): Promise<NotificationsConfigureCommitResult> {
+		if (this.stateId === "saving") return await unresolved<NotificationsConfigureCommitResult>();
+		this.#state = {
+			...this.#state,
+			status: {
+				...this.#state.status,
+				enabled: true,
+				globallyConfigured: true,
+				telegram: {
+					botTokenMasked: "••••••••",
+					channel: "1001",
+					configured: true,
+					tokenFingerprint: "telegram:2050feed",
+				},
+			},
+		};
+		return { status: "saved", receipt: SHOWCASE_RECEIPT, message: "Telegram configuration saved atomically." };
+	}
+
+	async saveInactive(_draft: PreparedTelegramConfiguration): Promise<NotificationsSaveInactiveResult> {
+		return { status: "saved_inactive", receipt: SHOWCASE_RECEIPT, message: "Telegram configuration saved inactive." };
+	}
+
+	discardConfigureDraft(_draft: PreparedTelegramConfiguration): void {}
+
+	async enableGlobally(): Promise<NotificationsMutationResult> {
+		this.#state = { ...this.#state, status: { ...this.#state.status, enabled: true } };
+		return { message: "Global notifications enabled using stored credentials." };
+	}
+
+	async disableGlobally(): Promise<NotificationsMutationResult> {
+		this.#state = { ...this.#state, status: { ...this.#state.status, enabled: false } };
+		return { message: "Notifications disabled globally." };
+	}
+
+	async removeTelegram(): Promise<NotificationsMutationResult & { globallyDisabled?: boolean }> {
+		this.#state = {
+			...this.#state,
+			status: {
+				...this.#state.status,
+				telegram: {
+					botTokenMasked: "(not set)",
+					channel: undefined,
+					configured: false,
+					tokenFingerprint: undefined,
+				},
+			},
+		};
+		return { message: "Telegram removed; other adapters remain unchanged.", globallyDisabled: false };
+	}
+
+	async setSessionLocal(enabled: boolean): Promise<NotificationSessionReconcileResult> {
+		const status = { ...this.#state.session, locallyEnabled: enabled, effectiveEnabled: enabled, running: enabled };
+		this.#state = { ...this.#state, session: status };
+		return { outcome: enabled ? "started" : "stopped", status };
+	}
+
+	async commitPreferences(preferences: NotificationsEditorPreferences): Promise<NotificationsMutationResult> {
+		this.#state = {
+			...this.#state,
+			preferences: { ...preferences },
+			status: { ...this.#state.status, redact: preferences.redact, verbosity: preferences.verbosity },
+		};
+		return { message: "Notification preferences saved atomically." };
+	}
+
+	async reconcileCurrentSession(): Promise<NotificationSessionReconcileResult> {
+		return { outcome: "already", status: this.#state.session };
+	}
+}
+
+async function settleEditor(): Promise<void> {
+	for (let index = 0; index < 8; index += 1) await Promise.resolve();
+}
+
+function selectAction(component: NotificationsSettingsEditorComponent, index: number): void {
+	for (let count = 0; count < index; count += 1) component.handleInput("\x1b[B");
+}
+
+function enterTelegramSetup(component: NotificationsSettingsEditorComponent): void {
+	component.handleInput("\n");
+	component.handleInput("1001");
+	component.handleInput("\n");
+}
+
+function startPairing(component: NotificationsSettingsEditorComponent): void {
+	enterTelegramSetup(component);
+	component.handleInput(SHOWCASE_TOKEN);
+	component.handleInput("\n");
+}
+
+async function navigateToState(
+	component: NotificationsSettingsEditorComponent,
+	stateId: NotificationsSettingsShowcaseStateId,
+): Promise<readonly string[]> {
+	switch (stateId) {
+		case "setup-provider":
+			component.handleInput("\n");
+			return ["home:Configure Telegram"];
+		case "setup-token-entry":
+			enterTelegramSetup(component);
+			return ["home:Configure Telegram", "chat-entry:private chat ID"];
+		case "setup-validating":
+			enterTelegramSetup(component);
+			component.handleInput(SHOWCASE_TOKEN);
+			return ["home:Configure Telegram", "chat-entry:private chat ID", "token-entry:masked token"];
+		case "setup-threaded-warning":
+		case "setup-review":
+			startPairing(component);
+			await settleEditor();
+			return ["home:Configure Telegram", "chat-entry:private chat ID", "token-entry:masked token", "review"];
+		case "setup-pairing":
+			startPairing(component);
+			return ["home:Configure Telegram", "chat-entry:private chat ID", "token-entry:masked token", "pairing"];
+		case "saving":
+			startPairing(component);
+			await settleEditor();
+			component.handleInput("\n");
+			return [
+				"home:Configure Telegram",
+				"chat-entry:private chat ID",
+				"token-entry:masked token",
+				"review:Save configuration",
+			];
+		case "health-probing":
+			selectAction(component, 5);
+			component.handleInput("\n");
+			return ["home:Probe health"];
+		case "health-ok":
+			selectAction(component, 4);
+			component.handleInput("\n");
+			await settleEditor();
+			return ["home:Refresh health"];
+		case "testing":
+			selectAction(component, 6);
+			component.handleInput("\n");
+			return ["home:Send test notification"];
+		case "recovering":
+			selectAction(component, 7);
+			component.handleInput("\n");
+			return ["home:Recover notification delivery"];
+		case "reconnecting":
+			selectAction(component, 8);
+			component.handleInput("\n");
+			return ["home:Reconnect Telegram runtime"];
+		case "navigation-locked":
+			selectAction(component, 6);
+			component.handleInput("\n");
+			component.handleInput("\x1b");
+			return ["home:Send test notification", "Escape while guarded"];
+		case "confirmation-remove":
+			selectAction(component, 9);
+			component.handleInput("\n");
+			return ["home:Remove Telegram"];
+		case "confirmation-disable":
+			selectAction(component, 2);
+			component.handleInput("\n");
+			return ["home:Disable globally"];
+		case "success":
+			selectAction(component, 1);
+			component.handleInput("\n");
+			await settleEditor();
+			return ["home:Enable globally"];
+		case "error":
+			selectAction(component, 7);
+			component.handleInput("\n");
+			await settleEditor();
+			return ["home:Recover notification delivery"];
+		case "foreign-blocked":
+			selectAction(component, 8);
+			component.handleInput("\n");
+			await settleEditor();
+			return ["home:Reconnect Telegram runtime"];
+		case "cancellation":
+			startPairing(component);
+			component.handleInput("\x1b");
+			return ["home:Configure Telegram", "chat-entry:private chat ID", "token-entry:masked token", "pairing:Escape"];
+		default:
+			return ["home"];
+	}
+}
+
+async function configureDeterministicTheme(renderMode: NotificationsSettingsShowcaseRenderMode): Promise<() => void> {
+	const originalColorTerm = Bun.env.COLORTERM;
+	const originalChalkLevel = chalk.level;
+	Bun.env.COLORTERM = "truecolor";
+	chalk.level = 3;
+	try {
+		await initTheme(false, renderMode === "ascii-no-color" ? "ascii" : "unicode", false, "red-claw", "red-claw");
+	} catch (error) {
+		chalk.level = originalChalkLevel;
+		throw error;
+	} finally {
+		if (originalColorTerm === undefined) delete Bun.env.COLORTERM;
+		else Bun.env.COLORTERM = originalColorTerm;
+	}
+	return () => {
+		chalk.level = originalChalkLevel;
+	};
+}
+
+export async function renderNotificationsSettingsShowcase(
+	entry: NotificationsSettingsShowcaseEntry,
+): Promise<NotificationsSettingsShowcaseRender> {
+	showcaseState(entry.stateId);
+	const restoreChalk = await configureDeterministicTheme(entry.renderMode);
+	let component: NotificationsSettingsEditorComponent | undefined;
+	try {
+		const operations = new DeterministicNotificationsEditorOperations(entry.stateId, SHOWCASE_CLOCK);
+		component = new NotificationsSettingsEditorComponent(operations);
+		component.focused = true;
+		await settleEditor();
+		const navigation = await navigateToState(component, entry.stateId);
+		const rendered = `${component.render(entry.viewport.columns).join("\n")}\n`;
+		const terminalAnsiText = entry.renderMode === "ascii-no-color" ? Bun.stripANSI(rendered) : rendered;
+		return {
+			terminalText: Bun.stripANSI(terminalAnsiText),
+			terminalAnsiText,
+			captureMode: "live-editor",
+			state: operations.snapshot,
+			mode: component.mode,
+			navigation,
+			fixedClockTimestamp: new Date(SHOWCASE_CLOCK.now()).toISOString(),
+		};
+	} finally {
+		component?.dispose();
+		restoreChalk();
+	}
 }

@@ -1,0 +1,190 @@
+import { describe, expect, test } from "bun:test";
+import type { NotificationConfig } from "../src/notifications/config";
+import {
+	type BoundNotificationSession,
+	type NotificationSessionContext,
+	NotificationSessionController,
+	type NotificationSessionRuntime,
+} from "../src/notifications/session-control";
+
+const BASE_CONFIG: NotificationConfig = {
+	enabled: false,
+	botToken: undefined,
+	chatId: undefined,
+	discord: { botToken: undefined, channelId: undefined },
+	slack: { botToken: undefined, channelId: undefined },
+	redact: false,
+	verbosity: "lean",
+	sessionScope: "all",
+	idleTimeoutMs: 60_000,
+	rich: { enabled: true },
+	richDraft: { enabled: false },
+	topics: { nameTemplate: undefined },
+};
+
+type Call = { kind: "start" | "stop" | "daemon"; cwd: string; sessionId: string };
+
+function createContext(
+	cwd = "/workspace/one",
+	sessionId = "session-one",
+): {
+	context: NotificationSessionContext;
+	setSession(cwd: string, sessionId: string): void;
+} {
+	let currentCwd = cwd;
+	let currentSessionId = sessionId;
+	return {
+		context: {
+			sessionManager: {
+				getCwd: () => currentCwd,
+				getSessionId: () => currentSessionId,
+			},
+		},
+		setSession: (nextCwd, nextSessionId) => {
+			currentCwd = nextCwd;
+			currentSessionId = nextSessionId;
+		},
+	};
+}
+
+function createRuntime(calls: Call[]): NotificationSessionRuntime {
+	const running = new Set<string>();
+	const record = (kind: Call["kind"], binding: BoundNotificationSession): void => {
+		calls.push({ kind, cwd: binding.cwd, sessionId: binding.sessionId });
+	};
+	return {
+		isRunning: binding => running.has(binding.sessionId),
+		start: async binding => {
+			record("start", binding);
+			if (running.has(binding.sessionId)) return "already";
+			running.add(binding.sessionId);
+			return "started";
+		},
+		stop: async binding => {
+			record("stop", binding);
+			return running.delete(binding.sessionId);
+		},
+		ensureTelegramDaemon: async binding => {
+			record("daemon", binding);
+		},
+	};
+}
+
+const telegramConfig = (): NotificationConfig => ({
+	...BASE_CONFIG,
+	enabled: true,
+	botToken: "telegram-token",
+	chatId: "telegram-chat",
+});
+
+const discordConfig = (): NotificationConfig => ({
+	...BASE_CONFIG,
+	enabled: true,
+	discord: { botToken: "discord-token", channelId: "discord-channel" },
+});
+
+const slackConfig = (): NotificationConfig => ({
+	...BASE_CONFIG,
+	enabled: true,
+	slack: { botToken: "slack-token", channelId: "slack-channel" },
+});
+
+describe("NotificationSessionController", () => {
+	test("locally off remains stopped through setup until session-local on without restart", async () => {
+		let config = BASE_CONFIG;
+		const calls: Call[] = [];
+		const controller = new NotificationSessionController({ eligible: true, getConfig: () => config, env: {} });
+		controller.attachRuntime(createRuntime(calls));
+		const { context } = createContext();
+
+		expect((await controller.setLocalEnabled(context, false)).outcome).toBe("disabled");
+		config = telegramConfig();
+		expect((await controller.reconcileCurrentSession(context)).outcome).toBe("disabled");
+		expect(calls).toEqual([]);
+
+		expect((await controller.setLocalEnabled(context, true)).outcome).toBe("started");
+		expect(calls).toEqual([
+			{ kind: "start", cwd: "/workspace/one", sessionId: "session-one" },
+			{ kind: "daemon", cwd: "/workspace/one", sessionId: "session-one" },
+		]);
+	});
+
+	test("starts generic endpoints for Discord, Slack, and token-only opt-in without Telegram daemon", async () => {
+		for (const input of [
+			{ config: discordConfig(), env: {} },
+			{ config: slackConfig(), env: {} },
+			{ config: BASE_CONFIG, env: { GJC_NOTIFICATIONS_TOKEN: "legacy-token" } },
+		]) {
+			const calls: Call[] = [];
+			const controller = new NotificationSessionController({
+				eligible: true,
+				getConfig: () => input.config,
+				env: input.env,
+			});
+			controller.attachRuntime(createRuntime(calls));
+			const result = await controller.reconcileCurrentSession(createContext().context);
+			expect(result.outcome).toBe("started");
+			expect(calls.filter(call => call.kind === "start")).toHaveLength(1);
+			expect(calls.filter(call => call.kind === "daemon")).toHaveLength(0);
+		}
+	});
+
+	test("a dormant unconfigured or hard-disabled controller has no endpoint or daemon side effects", async () => {
+		for (const input of [
+			{ eligible: true, config: BASE_CONFIG, env: {} },
+			{ eligible: false, config: telegramConfig(), env: { GJC_NOTIFICATIONS: "0" } },
+		]) {
+			const calls: Call[] = [];
+			const controller = new NotificationSessionController({
+				eligible: input.eligible,
+				getConfig: () => input.config,
+				env: input.env,
+			});
+			controller.attachRuntime(createRuntime(calls));
+			expect((await controller.reconcileCurrentSession(createContext().context)).outcome).toBe("disabled");
+			expect(calls).toEqual([]);
+		}
+	});
+
+	test("binds cwd and session id from the session manager for every operation", async () => {
+		const calls: Call[] = [];
+		const controller = new NotificationSessionController({ eligible: true, getConfig: telegramConfig, env: {} });
+		controller.attachRuntime(createRuntime(calls));
+		const host = createContext();
+
+		await controller.reconcileCurrentSession(host.context);
+		host.setSession("/workspace/two", "session-two");
+		await controller.reconcileCurrentSession(host.context);
+		expect(calls).toEqual([
+			{ kind: "start", cwd: "/workspace/one", sessionId: "session-one" },
+			{ kind: "daemon", cwd: "/workspace/one", sessionId: "session-one" },
+			{ kind: "start", cwd: "/workspace/two", sessionId: "session-two" },
+			{ kind: "daemon", cwd: "/workspace/two", sessionId: "session-two" },
+		]);
+	});
+
+	test("preserves authoritative GJC_NOTIFICATIONS=0 and explicit GJC_NOTIFICATIONS=1 precedence", async () => {
+		const offCalls: Call[] = [];
+		const offController = new NotificationSessionController({
+			eligible: true,
+			getConfig: telegramConfig,
+			env: { GJC_NOTIFICATIONS: "0" },
+		});
+		offController.attachRuntime(createRuntime(offCalls));
+		expect((await offController.setLocalEnabled(createContext().context, true)).outcome).toBe("disabled");
+		expect(offCalls).toEqual([]);
+
+		const explicitCalls: Call[] = [];
+		const explicitController = new NotificationSessionController({
+			eligible: true,
+			getConfig: () => BASE_CONFIG,
+			env: { GJC_NOTIFICATIONS: "1" },
+		});
+		explicitController.attachRuntime(createRuntime(explicitCalls));
+		const host = createContext();
+		expect((await explicitController.reconcileCurrentSession(host.context)).outcome).toBe("started");
+		expect((await explicitController.setLocalEnabled(host.context, false)).outcome).toBe("stopped");
+		expect((await explicitController.setLocalEnabled(host.context, true)).outcome).toBe("started");
+		expect(explicitCalls.map(call => call.kind)).toEqual(["start", "stop", "start"]);
+	});
+});

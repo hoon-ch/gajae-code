@@ -46,6 +46,7 @@ import { consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request"
 import { type Goal, type GoalModeState, normalizeGoal } from "../goals/state";
 import { resolveLocalUrlToPath } from "../internal-urls";
 import { getLspStartupWarningMessage, LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
+import type { NotificationSessionReconcileResult, NotificationSessionStatus } from "../notifications/session-control";
 import {
 	humanizePlanTitle,
 	type PlanApprovalDetails,
@@ -531,6 +532,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController = new SelectorController(this);
 		this.#inputController = new InputController(this);
 		this.#observerRegistry = new SessionObserverRegistry();
+	}
+
+	getCurrentSessionNotificationStatus(): NotificationSessionStatus | undefined {
+		return this.session.notificationSessionController?.query({ sessionManager: this.sessionManager });
+	}
+
+	async setCurrentSessionNotificationsEnabled(
+		enabled: boolean,
+	): Promise<NotificationSessionReconcileResult | undefined> {
+		return await this.session.notificationSessionController?.setLocalEnabled(
+			{ sessionManager: this.sessionManager },
+			enabled,
+		);
 	}
 
 	async init(): Promise<void> {

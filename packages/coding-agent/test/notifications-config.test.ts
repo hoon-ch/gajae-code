@@ -10,6 +10,7 @@ import {
 	completionNotifyDisabledByEnv,
 	getNotificationConfig,
 	isGloballyConfigured,
+	isNotificationHostEligible,
 	isSessionNotificationsEnabled,
 	isTelegramConfigured,
 	maskToken,
@@ -359,6 +360,32 @@ describe("notifications config", () => {
 		).toBe(false);
 	});
 
+	test("isNotificationHostEligible preserves hard-off, subagent, and primary-scope precedence", () => {
+		const primary = { ...PRIMARY_GLOBAL_CFG, sessionScope: "primary" as const };
+		expect(isNotificationHostEligible({ env: { GJC_NOTIFY: "off", GJC_NOTIFICATIONS: "1" } })).toBe(false);
+		expect(isNotificationHostEligible({ env: { GJC_NOTIFICATIONS: "1" }, taskDepth: 1 })).toBe(false);
+		expect(isNotificationHostEligible({ env: { GJC_NOTIFICATIONS: "0" } })).toBe(false);
+		expect(isNotificationHostEligible({ env: {}, hostModeSupported: false })).toBe(false);
+		expect(isNotificationHostEligible({ env: {}, sessionScope: primary.sessionScope, spawnedByGjc: true })).toBe(
+			false,
+		);
+		expect(
+			isNotificationHostEligible({
+				env: { GJC_NOTIFICATIONS: "1" },
+				sessionScope: primary.sessionScope,
+				spawnedByGjc: true,
+			}),
+		).toBe(true);
+		expect(
+			isNotificationHostEligible({
+				env: { GJC_NOTIFICATIONS_TOKEN: "explicit-token" },
+				sessionScope: primary.sessionScope,
+				spawnedByGjc: true,
+			}),
+		).toBe(true);
+		expect(isNotificationHostEligible({ env: {} })).toBe(true);
+	});
+
 	test("getNotificationConfig reads sessionScope", () => {
 		expect(getNotificationConfig(Settings.isolated()).sessionScope).toBe("all");
 		expect(getNotificationConfig(Settings.isolated({ "notifications.sessionScope": "primary" })).sessionScope).toBe(
@@ -594,8 +621,12 @@ describe("notifications config", () => {
 		tempDirs.push(cwd);
 		const previousNotif = process.env.GJC_NOTIFICATIONS;
 		const previousSpawn = process.env.GJC_SPAWNED_BY_SESSION;
+		const previousToken = process.env.GJC_NOTIFICATIONS_TOKEN;
+		const previousCompletionNotify = process.env.GJC_NOTIFY;
 		delete process.env.GJC_NOTIFICATIONS;
 		delete process.env.GJC_SPAWNED_BY_SESSION;
+		delete process.env.GJC_NOTIFICATIONS_TOKEN;
+		delete process.env.GJC_NOTIFY;
 		const adapterSettings = (scope: "all" | "primary"): Settings =>
 			Settings.isolated({
 				"notifications.enabled": true,
@@ -646,19 +677,46 @@ describe("notifications config", () => {
 			disposers.push(() => optedIn.session.dispose());
 			delete process.env.GJC_NOTIFICATIONS;
 
+			// 4. The legacy explicit token has the same primary-scope override.
+			process.env.GJC_SPAWNED_BY_SESSION = "parent-abc";
+			process.env.GJC_NOTIFICATIONS_TOKEN = "legacy-token";
+			const tokenOptedIn = await spawn(primarySettings);
+			disposers.push(() => tokenOptedIn.session.dispose());
+			delete process.env.GJC_NOTIFICATIONS_TOKEN;
+
+			// 5. Hard environment opt-outs must not register a command surface or endpoint.
+			process.env.GJC_NOTIFY = "off";
+			const completionOptedOut = await spawn(allSettings);
+			disposers.push(() => completionOptedOut.session.dispose());
+			delete process.env.GJC_NOTIFY;
+			process.env.GJC_NOTIFICATIONS = "0";
+			const notificationsOptedOut = await spawn(allSettings);
+			disposers.push(() => notificationsOptedOut.session.dispose());
+			delete process.env.GJC_NOTIFICATIONS;
+
 			await suppressed.session.extensionRunner?.emit({ type: "session_start" });
 			await preserved.session.extensionRunner?.emit({ type: "session_start" });
 			await optedIn.session.extensionRunner?.emit({ type: "session_start" });
+			await tokenOptedIn.session.extensionRunner?.emit({ type: "session_start" });
+			await completionOptedOut.session.extensionRunner?.emit({ type: "session_start" });
+			await notificationsOptedOut.session.extensionRunner?.emit({ type: "session_start" });
 
 			expect(fs.existsSync(endpointFor(suppressed.session.sessionId))).toBe(false);
 			expect(fs.existsSync(endpointFor(preserved.session.sessionId))).toBe(true);
 			expect(fs.existsSync(endpointFor(optedIn.session.sessionId))).toBe(true);
+			expect(fs.existsSync(endpointFor(tokenOptedIn.session.sessionId))).toBe(true);
+			expect(fs.existsSync(endpointFor(completionOptedOut.session.sessionId))).toBe(false);
+			expect(fs.existsSync(endpointFor(notificationsOptedOut.session.sessionId))).toBe(false);
 		} finally {
 			await Promise.all(disposers.reverse().map(dispose => dispose()));
 			if (previousNotif === undefined) delete process.env.GJC_NOTIFICATIONS;
 			else process.env.GJC_NOTIFICATIONS = previousNotif;
 			if (previousSpawn === undefined) delete process.env.GJC_SPAWNED_BY_SESSION;
 			else process.env.GJC_SPAWNED_BY_SESSION = previousSpawn;
+			if (previousToken === undefined) delete process.env.GJC_NOTIFICATIONS_TOKEN;
+			else process.env.GJC_NOTIFICATIONS_TOKEN = previousToken;
+			if (previousCompletionNotify === undefined) delete process.env.GJC_NOTIFY;
+			else process.env.GJC_NOTIFY = previousCompletionNotify;
 			resetSettingsForTest();
 		}
 	}, 30000);

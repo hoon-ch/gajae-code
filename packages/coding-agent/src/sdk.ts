@@ -93,10 +93,11 @@ import { resolveMemoryBackend } from "./memory-backend";
 import { createNotificationsExtension } from "./notifications";
 import {
 	getNotificationConfig,
+	isNotificationHostEligible,
 	type NotificationConfig,
 	SPAWN_PROVENANCE_ENV,
-	shouldRegisterNotificationsExtension,
 } from "./notifications/config";
+import { NotificationSessionController } from "./notifications/session-control";
 import asyncResultTemplate from "./prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
 import { MCPManager } from "./runtime-mcp";
@@ -383,6 +384,8 @@ export interface CreateAgentSessionOptions {
 
 	/** Whether UI is available (enables interactive tools like ask). Default: false */
 	hasUI?: boolean;
+	/** Whether this host mode can own a notification session endpoint. Default: true. */
+	notificationHostModeSupported?: boolean;
 
 	/**
 	 * Opt-in OpenTelemetry instrumentation forwarded to the underlying Agent.
@@ -1625,17 +1628,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const spawnProvenance = process.env[SPAWN_PROVENANCE_ENV];
 		const spawnedByGjc = typeof spawnProvenance === "string" && spawnProvenance.trim().length > 0;
 		delete process.env[SPAWN_PROVENANCE_ENV];
-		if (
-			shouldRegisterNotificationsExtension({
-				env: process.env,
-				cfg: notificationCfg,
-				taskDepth,
-				parentTaskPrefix: options.parentTaskPrefix,
-				currentAgentType: options.currentAgentType,
-				spawnedByGjc,
-			})
-		) {
-			inlineExtensions.push(api => createNotificationsExtension(api, { settings }));
+		const notificationHostEligible = isNotificationHostEligible({
+			env: process.env,
+			hostModeSupported: options.notificationHostModeSupported ?? true,
+			taskDepth,
+			parentTaskPrefix: options.parentTaskPrefix,
+			currentAgentType: options.currentAgentType,
+			sessionScope: notificationCfg?.sessionScope,
+			spawnedByGjc,
+		});
+		const notificationSessionController = notificationHostEligible
+			? new NotificationSessionController({
+					eligible: true,
+					getConfig: () => getNotificationConfig(settings),
+				})
+			: undefined;
+		if (notificationSessionController) {
+			inlineExtensions.push(api =>
+				createNotificationsExtension(api, { settings, controller: notificationSessionController }),
+			);
 		}
 
 		// Extension/module discovery is quarantined; retain only the private
@@ -2337,6 +2348,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			thinkingLevel,
 			sessionManager,
 			settings,
+			notificationSessionController,
 			evalKernelOwnerId,
 			// Defined only for top-level sessions (creation is gated above).
 			// AgentSession uses this to decide whether it may dispose the global

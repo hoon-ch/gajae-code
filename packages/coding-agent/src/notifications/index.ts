@@ -47,14 +47,9 @@ import type {
 } from "../tools";
 import { registerAskAnswerSource, registerWorkflowGateEmitterListener } from "../tools/ask-answer-registry";
 import { registerTelegramFileSink } from "./attachment-registry";
-import {
-	getNotificationConfig,
-	isSessionNotificationsEnabled,
-	isTelegramConfigured,
-	type NotificationConfig,
-	sessionTag,
-} from "./config";
+import { getNotificationConfig, isNotificationHostEligible, type NotificationConfig, sessionTag } from "./config";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage } from "./helpers";
+import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import { ensureTelegramDaemonRunning } from "./telegram-daemon";
 
 // ===========================================================================
@@ -933,9 +928,21 @@ function sessionIdFromFile(file: string | undefined): string | undefined {
 	return underscore >= 0 ? base.slice(underscore + 1) : undefined;
 }
 
-export function createNotificationsExtension(api: ExtensionAPI, options: { settings?: Settings } = {}): void {
+export function createNotificationsExtension(
+	api: ExtensionAPI,
+	options: { settings?: Settings; controller?: NotificationSessionController } = {},
+): void {
 	const runtimes = new Map<string, SessionRuntime>();
-	const disabledSessions = new Set<string>();
+	const fallbackConfig = resolveSettings(options.settings).cfg;
+	const controller =
+		options.controller ??
+		new NotificationSessionController({
+			eligible: isNotificationHostEligible({
+				env: process.env,
+				sessionScope: fallbackConfig.sessionScope,
+			}),
+			getConfig: () => resolveSettings(options.settings).cfg,
+		});
 	const sessionId = (ctx: ExtensionContext): string => ctx.sessionManager.getSessionId();
 	const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -984,21 +991,15 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 		return true;
 	}
 
-	function isEnabledForSession(id: string, cfg: NotificationConfig): boolean {
-		return isSessionNotificationsEnabled({ cfg, env: process.env, sessionDisabled: disabledSessions.has(id) });
-	}
-
-	function isNotificationEligibleContext(ctx: ExtensionContext): boolean {
-		return ctx.sessionMetadata?.kind !== "sub";
-	}
-
-	async function startSession(ctx: ExtensionContext): Promise<"started" | "already" | "disabled" | "failed"> {
-		const id = sessionId(ctx);
-		const { settings, cfg, settingsAvailable } = resolveSettings(options.settings);
-		if (!isNotificationEligibleContext(ctx) || !isEnabledForSession(id, cfg)) return "disabled";
+	async function startEndpoint(
+		ctx: ExtensionContext,
+		cwd: string,
+		id: string,
+	): Promise<"started" | "already" | "disabled" | "failed"> {
+		const { cfg } = resolveSettings(options.settings);
 		if (runtimes.has(id)) return "already";
 
-		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
+		const stateRoot = path.join(cwd, ".gjc", "state");
 		const gateOptions = new Map<string, string[]>();
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const tag = sessionTag(id);
@@ -1324,14 +1325,6 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 			});
 			logger.info(`notifications: serving session ${id} at ${endpoint.url}`);
 
-			if (settingsAvailable && settings && isTelegramConfigured(cfg)) {
-				try {
-					await ensureTelegramDaemonRunning({ settings, cwd: ctx.cwd, sessionId: id });
-				} catch (e) {
-					logger.warn(`notifications: failed to ensure Telegram daemon: ${String(e)}`);
-				}
-			}
-
 			// One-time identity header (repo/branch/machine/session) pinned at the top
 			// of the session thread by the daemon.
 			try {
@@ -1339,7 +1332,7 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 					JSON.stringify({
 						type: "identity_header",
 						sessionId: id,
-						...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
+						...buildIdentity(cwd, ctx.sessionManager.getSessionName()),
 					}),
 				);
 			} catch (e) {
@@ -1426,23 +1419,38 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 		}
 	}
 
+	const sessionRuntime: NotificationSessionRuntime<ExtensionContext> = {
+		isRunning: binding => runtimes.has(binding.sessionId),
+		start: async binding => {
+			// This protects manually registered extension factories. SDK-created
+			// controllers exclude subagents at Gate A before command registration.
+			if (binding.context.sessionMetadata?.kind === "sub") return "disabled";
+			return await startEndpoint(binding.context, binding.cwd, binding.sessionId);
+		},
+		stop: async binding => await stopSession(binding.sessionId),
+		ensureTelegramDaemon: async binding => {
+			const { settings, settingsAvailable } = resolveSettings(options.settings);
+			if (!settingsAvailable || !settings) return;
+			try {
+				await ensureTelegramDaemonRunning({ settings, cwd: binding.cwd, sessionId: binding.sessionId });
+			} catch (e) {
+				logger.warn(`notifications: failed to ensure Telegram daemon: ${String(e)}`);
+			}
+		},
+	};
+	controller.attachRuntime(sessionRuntime);
+
 	api.registerCommand("notify", {
 		description: "Control notifications for this session (on, off, status).",
 		async handler(args: string, ctx: ExtensionCommandContext): Promise<void> {
-			const id = sessionId(ctx);
 			const command = args.trim().split(/\s+/, 1)[0]?.toLowerCase() || "status";
 			const resolved = resolveSettings(options.settings);
-			const enabledWithoutLocalOff = isSessionNotificationsEnabled({
-				cfg: resolved.cfg,
-				env: process.env,
-				sessionDisabled: false,
-			});
 
 			if (command === "off") {
-				disabledSessions.add(id);
-				const stopped = await stopSession(id);
+				const wasRunning = controller.query(ctx).running;
+				await controller.setLocalEnabled(ctx, false);
 				ctx.ui.notify(
-					stopped
+					wasRunning
 						? "Notifications disabled for this session."
 						: "Notifications already disabled for this session.",
 					"info",
@@ -1451,35 +1459,23 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 			}
 
 			if (command === "on") {
-				if (!isNotificationEligibleContext(ctx)) {
-					ctx.ui.notify("Notifications are disabled for subagent sessions.", "warning");
-					return;
-				}
-				if (process.env.GJC_NOTIFICATIONS === "0") {
+				const result = await controller.setLocalEnabled(ctx, true);
+				if (result.status.environment === "off") {
 					ctx.ui.notify(
 						"Notifications remain disabled: GJC_NOTIFICATIONS=0 is an authoritative opt-out.",
 						"warning",
 					);
 					return;
 				}
-				if (!enabledWithoutLocalOff) {
-					ctx.ui.notify(
-						"Notifications are not configured. Run `gjc notify setup` or set GJC_NOTIFICATIONS=1.",
-						"warning",
-					);
-					return;
-				}
-				disabledSessions.delete(id);
-				const result = await startSession(ctx);
 				ctx.ui.notify(
-					result === "started"
+					result.outcome === "started"
 						? "Notifications enabled for this session."
-						: result === "already"
+						: result.outcome === "already"
 							? "Notifications already enabled for this session."
-							: result === "failed"
+							: result.outcome === "failed"
 								? "Notifications failed to start for this session."
 								: "Notifications are not configured. Run `gjc notify setup` or set GJC_NOTIFICATIONS=1.",
-					result === "failed" ? "error" : result === "disabled" ? "warning" : "info",
+					result.outcome === "failed" ? "error" : result.outcome === "disabled" ? "warning" : "info",
 				);
 				return;
 			}
@@ -1489,19 +1485,17 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 				return;
 			}
 
-			const running = runtimes.has(id);
-			const locallyDisabled = disabledSessions.has(id);
-			const enabled = isEnabledForSession(id, resolved.cfg);
-			const runtime = runtimes.get(id);
+			const status = controller.query(ctx);
+			const runtime = runtimes.get(ctx.sessionManager.getSessionId());
 			ctx.ui.notify(
-				`Notifications ${running ? "running" : enabled ? "enabled" : "disabled"} for this session; redaction ${(runtime?.redact ?? resolved.cfg.redact) ? "on" : "off"}; verbosity ${runtime?.verbosity ?? resolved.cfg.verbosity}${locallyDisabled ? "; locally off" : ""}.`,
+				`Notifications ${status.running ? "running" : status.effectiveEnabled ? "enabled" : "disabled"} for this session; redaction ${(runtime?.redact ?? resolved.cfg.redact) ? "on" : "off"}; verbosity ${runtime?.verbosity ?? resolved.cfg.verbosity}${status.locallyEnabled ? "" : "; locally off"}.`,
 				"info",
 			);
 		},
 	});
 
 	api.on("session_start", async (_event, ctx) => {
-		await startSession(ctx);
+		await controller.reconcileCurrentSession(ctx);
 	});
 
 	// A session id change within the same process needs reason-aware handling.
@@ -1521,13 +1515,13 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 		if (!prevId || prevId === newId) return;
 
 		if (event.reason === "resume") {
-			stopSession(prevId);
-			await startSession(ctx);
+			await stopSession(prevId);
+			await controller.reconcileCurrentSession(ctx);
 			return;
 		}
 
 		// `/new` / fork: re-key in place and rename the existing topic.
-		if (disabledSessions.delete(prevId)) disabledSessions.add(newId);
+		controller.rekeySession(prevId, newId);
 		const rt = runtimes.get(prevId);
 		if (!rt || runtimes.has(newId)) return;
 		runtimes.delete(prevId);
@@ -1581,7 +1575,7 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 					JSON.stringify({
 						type: "identity_header",
 						sessionId: newId,
-						...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
+						...buildIdentity(ctx.sessionManager.getCwd(), ctx.sessionManager.getSessionName()),
 					}),
 				);
 			} catch (e) {
@@ -1830,6 +1824,6 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 	});
 
 	api.on("session_shutdown", async (_event, ctx) => {
-		await stopSession(sessionId(ctx));
+		await controller.stopCurrentSession(ctx);
 	});
 }

@@ -215,6 +215,7 @@ import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import { resolveMemoryBackend } from "../memory-backend";
 import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/unattended-session";
 import { getCurrentThemeName, theme } from "../modes/theme/theme";
+import type { NotificationSessionController } from "../notifications/session-control";
 import type { PlanModeState } from "../plan-mode/state";
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
@@ -383,6 +384,8 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
+	/** Shared Gate-A-eligible notification session controller, when this host supports it. */
+	notificationSessionController?: NotificationSessionController;
 	/** Models to cycle through with Alt+N (from --models flag) */
 	scopedModels?: ScopedModelSelection[];
 	/** Initial session thinking selector. */
@@ -1178,6 +1181,7 @@ export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settings: Settings;
+	readonly notificationSessionController: NotificationSessionController | undefined;
 	readonly taskDepth: number;
 	readonly yieldQueue: YieldQueue;
 
@@ -1524,6 +1528,7 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.notificationSessionController = config.notificationSessionController;
 		this.taskDepth = config.taskDepth ?? 0;
 		// Register this session with the process-wide resource GC (idle/RSS browser-tab eviction
 		// + stale screenshot cleanup). Session-keyed so concurrent sessions share one timer safely.

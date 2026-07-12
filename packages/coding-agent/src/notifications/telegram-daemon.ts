@@ -11,6 +11,10 @@ import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand, parseRichToggleCommand, parseTelegramControlCommand } from "./config-commands";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
+import { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
+
+export { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
+
 import {
 	buildCompactChoiceGrid,
 	code,
@@ -61,6 +65,8 @@ import { renderThreadedFrame, type ThreadedSend } from "./threaded-render";
 import { TopicRegistry, type TopicRegistryState } from "./topic-registry";
 
 export type EnsureDaemonResult = "owner_spawned" | "attached" | "disabled" | "blocked";
+/** Detailed result for orchestration that must distinguish a #2028 handoff from a fresh spawn. */
+export type EnsureTelegramDaemonDetailedResult = "spawned" | "reloaded" | "attached" | "disabled" | "blocked_identity";
 
 export interface DaemonState {
 	pid: number;
@@ -123,21 +129,9 @@ export { HEARTBEAT_TTL_MS };
 export const DAEMON_VERSION = 1;
 /** Capability token advertised when the server supports app-level ping/pong. */
 export const CLIENT_PING_PONG_CAPABILITY = "client_ping_pong";
-/** Protocol version the daemon advertises in its ClientHello. */
-export const NOTIFICATION_PROTOCOL_VERSION = 3;
 /** Capability required for typed controls and semantic Selected acknowledgement frames. */
 export const ASK_SELECTED_ACK_CAPABILITY = "ask_selected_ack_v1";
 export const ASK_CONTROLS_CAPABILITY = "ask_controls_v1";
-/**
- * Operational generation the current daemon build speaks, persisted into
- * {@link DaemonState.generation} on ownership acquisition. It is tied to the
- * wire {@link NOTIFICATION_PROTOCOL_VERSION} so any protocol bump (which is what
- * gates capabilities like {@link ASK_SELECTED_ACK_CAPABILITY}) also bumps the
- * generation, letting a freshly-upgraded host recognise an older, still-live
- * daemon and reload it instead of silently attaching to it. Distinct from the
- * persisted schema {@link DAEMON_VERSION}, which did not change across #1999.
- */
-export const DAEMON_GENERATION = NOTIFICATION_PROTOCOL_VERSION;
 
 const nodeFs: TelegramDaemonFs = fs.promises as unknown as TelegramDaemonFs;
 
@@ -541,14 +535,17 @@ export async function releaseDaemonOwnership(input: {
 
 /** Read the persisted daemon ownership state (or undefined when absent). */
 export async function readDaemonState(
-	settings: Settings,
+	settings: Pick<Settings, "getAgentDir">,
 	fs: TelegramDaemonFs = nodeFs,
 ): Promise<DaemonState | undefined> {
 	return readJson<DaemonState>(fs, daemonPaths(settings.getAgentDir()).state);
 }
 
 /** Read the persisted notification roots list. */
-export async function readDaemonRoots(settings: Settings, fs: TelegramDaemonFs = nodeFs): Promise<string[]> {
+export async function readDaemonRoots(
+	settings: Pick<Settings, "getAgentDir">,
+	fs: TelegramDaemonFs = nodeFs,
+): Promise<string[]> {
 	const roots = await readJson<{ roots?: string[] }>(fs, daemonPaths(settings.getAgentDir()).roots);
 	return roots?.roots ?? [];
 }
@@ -688,10 +685,14 @@ export async function spawnTelegramDaemonOwner(
 	return { result: "owner_spawned", ownerId: ownership.ownerId, runtime, warnings: [] };
 }
 
-export async function ensureTelegramDaemonRunning(
+/**
+ * Ensure a configured daemon owns this session root, preserving ownership safety
+ * while exposing whether a #2028 generation handoff was required.
+ */
+export async function ensureTelegramDaemonRunningDetailed(
 	input: { settings: Settings; cwd: string; sessionId: string },
 	deps: TelegramDaemonDeps = {},
-): Promise<EnsureDaemonResult> {
+): Promise<EnsureTelegramDaemonDetailedResult> {
 	const cfg = getNotificationConfig(input.settings);
 	if (!isTelegramConfigured(cfg)) return "disabled";
 	const root = notificationRootForCwd(input.cwd);
@@ -702,7 +703,7 @@ export async function ensureTelegramDaemonRunning(
 	);
 	if (spawned.result === "blocked") {
 		logger.warn(`notifications: failed to ensure Telegram daemon: ${spawned.warnings.join("; ")}`);
-		return spawned.result;
+		return "blocked_identity";
 	}
 	if (spawned.reloadRequired) {
 		// A still-live owner is running an OLDER daemon generation than this host
@@ -713,10 +714,32 @@ export async function ensureTelegramDaemonRunning(
 		// up a fresh current-generation daemon.
 		await registerNotificationRoot({ ...input, fs: deps.fs });
 		await reloadStaleGenerationOwner(input.settings, deps);
-		return "owner_spawned";
+		return "reloaded";
 	}
 	await registerNotificationRoot({ ...input, fs: deps.fs });
-	return spawned.result;
+	return spawned.result === "owner_spawned" ? "spawned" : "attached";
+}
+
+/**
+ * Legacy compatibility mapping for callers that only distinguish ownership from
+ * attachment. New orchestration should use {@link ensureTelegramDaemonRunningDetailed}.
+ */
+export async function ensureTelegramDaemonRunning(
+	input: { settings: Settings; cwd: string; sessionId: string },
+	deps: TelegramDaemonDeps = {},
+): Promise<EnsureDaemonResult> {
+	const result = await ensureTelegramDaemonRunningDetailed(input, deps);
+	switch (result) {
+		case "spawned":
+		case "reloaded":
+			return "owner_spawned";
+		case "attached":
+			return "attached";
+		case "disabled":
+			return "disabled";
+		case "blocked_identity":
+			return "blocked";
+	}
 }
 
 /**

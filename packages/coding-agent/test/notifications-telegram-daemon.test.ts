@@ -16,6 +16,7 @@ import {
 	DAEMON_VERSION,
 	daemonPaths,
 	ensureTelegramDaemonRunning,
+	ensureTelegramDaemonRunningDetailed,
 	registerNotificationRoot,
 	releaseDaemonOwnership,
 	renewDaemonHeartbeat,
@@ -495,6 +496,17 @@ describe("telegram daemon", () => {
 				version: DAEMON_VERSION,
 			}),
 		);
+		const beforeState = fs.readFileSync(paths.state, "utf8");
+		const signals: Array<[number, string]> = [];
+		const unlinked: string[] = [];
+		const baseFs = topicStateFs(async () => undefined);
+		const recordingFs: TelegramDaemonFs = {
+			...baseFs,
+			unlink: async file => {
+				unlinked.push(file);
+				await fs.promises.unlink(file);
+			},
+		};
 
 		let spawns = 0;
 		const result = await ensureTelegramDaemonRunning(
@@ -502,6 +514,8 @@ describe("telegram daemon", () => {
 			{
 				now: () => 101,
 				pidAlive: pid => pid === 999,
+				sendSignal: (pid, signal) => signals.push([pid, signal]),
+				fs: recordingFs,
 				spawn: () => {
 					spawns++;
 					return { unref() {} };
@@ -511,6 +525,10 @@ describe("telegram daemon", () => {
 
 		expect(result).toBe("blocked");
 		expect(spawns).toBe(0);
+		expect(signals).toEqual([]);
+		expect(unlinked).toEqual([]);
+		expect(fs.existsSync(paths.lock)).toBe(true);
+		expect(fs.readFileSync(paths.state, "utf8")).toBe(beforeState);
 		expect(fs.existsSync(paths.roots)).toBe(false);
 		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
 			ownerId: "old",
@@ -646,6 +664,53 @@ describe("telegram daemon", () => {
 		expect(after.generation).toBe(DAEMON_GENERATION);
 		// The new session's root is persisted so the replacement daemon serves it.
 		expect(after.roots).toContain(path.join(cwd, ".gjc", "state"));
+	});
+
+	test("detailed ensure reports reloaded only for the existing fresh-owner reloadRequired handoff", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, { heartbeatAt: Date.now() }); // Missing generation requests #2028 reload.
+		const alive = new Set<number>([999, 4242]);
+		const signals: Array<[number, string]> = [];
+		const result = await ensureTelegramDaemonRunningDetailed(
+			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
+			{
+				pid: 4242,
+				pidAlive: pid => alive.has(pid),
+				sendSignal: (pid, signal) => {
+					signals.push([pid, signal]);
+					if (signal === "SIGTERM") alive.delete(999);
+				},
+				sleep: async () => undefined,
+				spawn: () => ({ unref() {} }),
+			},
+		);
+		expect(result).toBe("reloaded");
+		expect(signals).toContainEqual([999, "SIGTERM"]);
+	});
+
+	test("detailed ensure keeps a stale-heartbeat live PID attached even when generation is older", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, { heartbeatAt: 100 }); // Missing generation, but stale heartbeat is fail-closed.
+		const signals: Array<[number, string]> = [];
+		let spawns = 0;
+		const result = await ensureTelegramDaemonRunningDetailed(
+			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
+			{
+				pid: 4242,
+				now: () => 100_000,
+				pidAlive: () => true,
+				sendSignal: (pid, signal) => signals.push([pid, signal]),
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			},
+		);
+		expect(result).toBe("attached");
+		expect(signals).toEqual([]);
+		expect(spawns).toBe(0);
 	});
 
 	test("#2028 ensureTelegramDaemonRunning reuses a current-generation live owner without a reload", async () => {

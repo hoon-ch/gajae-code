@@ -142,7 +142,42 @@ export function completionNotifyDisabledByEnv(env: NodeJS.ProcessEnv): boolean {
 	return v === "off" || v === "0" || v === "false";
 }
 
-/** Resolve whether the notifications extension should be registered at SDK startup. */
+/** Canonical host eligibility for the dormant notification session surface. */
+export interface NotificationHostEligibilityInput {
+	env: NodeJS.ProcessEnv;
+	/** False for host modes that cannot own a notification session endpoint. */
+	hostModeSupported?: boolean;
+	/** Task recursion depth; helper/subagent sessions must not own remote surfaces. */
+	taskDepth?: number;
+	/** Parent subagent id/prefix; present for helper/subagent sessions even when depth is omitted. */
+	parentTaskPrefix?: string;
+	/** Role-agent type/name; present for task sessions even if depth metadata is lost. */
+	currentAgentType?: string;
+	/** Canonical global session scope; absent preserves the default `all` behavior. */
+	sessionScope?: NotificationConfig["sessionScope"];
+	/** Whether this process was spawned by one of GJC's marked child spawn sites. */
+	spawnedByGjc?: boolean;
+}
+
+/**
+ * Resolve whether this host may receive the dormant notification controller.
+ * This intentionally says nothing about whether an adapter is configured: an
+ * eligible unconfigured host still gets a zero-side-effect control surface.
+ */
+export function isNotificationHostEligible(input: NotificationHostEligibilityInput): boolean {
+	if (completionNotifyDisabledByEnv(input.env)) return false;
+	if (input.hostModeSupported === false) return false;
+	if ((input.taskDepth ?? 0) > 0 || input.parentTaskPrefix || input.currentAgentType) return false;
+	if (input.env.GJC_NOTIFICATIONS === "0") return false;
+	if (input.env.GJC_NOTIFICATIONS === "1" || input.env.GJC_NOTIFICATIONS_TOKEN) return true;
+	if (input.spawnedByGjc && input.sessionScope === "primary") return false;
+	return true;
+}
+
+/**
+ * Legacy compatibility helper for callers that require both host eligibility
+ * and a currently configured or explicit notification runtime.
+ */
 export function shouldRegisterNotificationsExtension(input: {
 	env: NodeJS.ProcessEnv;
 	cfg?: NotificationConfig;
@@ -162,16 +197,23 @@ export function shouldRegisterNotificationsExtension(input: {
 	 */
 	spawnedByGjc?: boolean;
 }): boolean {
-	if ((input.taskDepth ?? 0) > 0 || input.parentTaskPrefix || input.currentAgentType) return false;
-	if (completionNotifyDisabledByEnv(input.env)) return false;
-	if (input.env.GJC_NOTIFICATIONS === "0") return false;
-	if (input.env.GJC_NOTIFICATIONS === "1" || input.env.GJC_NOTIFICATIONS_TOKEN) return true;
-	// Spawned-child suppression sits below explicit opt-in (so Telegram
-	// `/session_create` and cold `/session_resume`, which launch with
-	// GJC_NOTIFICATIONS=1, keep their fully bidirectional topic) and above global
-	// auto-on (so their children stay silent under `primary`).
-	if (input.spawnedByGjc && input.cfg?.sessionScope === "primary") return false;
-	return input.cfg ? isGloballyConfigured(input.cfg) : false;
+	if (
+		!isNotificationHostEligible({
+			env: input.env,
+			taskDepth: input.taskDepth,
+			parentTaskPrefix: input.parentTaskPrefix,
+			currentAgentType: input.currentAgentType,
+			sessionScope: input.cfg?.sessionScope,
+			spawnedByGjc: input.spawnedByGjc,
+		})
+	) {
+		return false;
+	}
+	return (
+		input.env.GJC_NOTIFICATIONS === "1" ||
+		Boolean(input.env.GJC_NOTIFICATIONS_TOKEN) ||
+		Boolean(input.cfg && isGloballyConfigured(input.cfg))
+	);
 }
 
 /**

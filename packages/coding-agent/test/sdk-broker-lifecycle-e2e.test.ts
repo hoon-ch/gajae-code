@@ -209,17 +209,20 @@ test("lifecycle host rejects a transcript replaced after strict authorization be
 		if (!candidate) throw new Error("Expected strict session candidate.");
 		const replacementPath = `${sessionPath}.replacement`;
 		await fs.writeFile(replacementPath, `${await fs.readFile(sessionPath, "utf8")}\n`);
-		const originalInventory = SessionManager.inventorySessionsStrict;
+		const originalCapture = SessionManager.captureTranscriptStrict;
 		let replaced = false;
-		const replaceAfterAuthorization: typeof SessionManager.inventorySessionsStrict = (cwd, options) => {
-			const result = originalInventory(cwd, options);
+		const replaceAfterAuthorization: typeof SessionManager.captureTranscriptStrict = (filePath, storage) => {
+			const result = originalCapture(filePath, storage);
 			if (!replaced) {
 				replaced = true;
 				renameSync(replacementPath, sessionPath);
 			}
 			return result;
 		};
-		SessionManager.inventorySessionsStrict = replaceAfterAuthorization;
+		SessionManager.captureTranscriptStrict = replaceAfterAuthorization;
+		const authorizedDigest = createHash("sha256")
+			.update(await fs.readFile(sessionPath))
+			.digest("hex");
 		try {
 			await expect(
 				openLifecycleSessionManager(
@@ -236,15 +239,16 @@ test("lifecycle host rejects a transcript replaced after strict authorization be
 							size: candidate.identity.size,
 							mtimeMs: candidate.identity.mtimeMs,
 							mtimeNs: candidate.identity.mtimeNs.toString(),
+							sha256: authorizedDigest,
 						},
 					},
 					root,
 					agentDir,
 				),
-			).rejects.toThrow("Lifecycle saved session authority changed before the session host consumed it.");
+			).rejects.toThrow("Lifecycle saved session authority changed while the session host opened it.");
 			expect(replaced).toBe(true);
 		} finally {
-			SessionManager.inventorySessionsStrict = originalInventory;
+			SessionManager.captureTranscriptStrict = originalCapture;
 		}
 	} finally {
 		await session.close();
@@ -284,6 +288,9 @@ test("lifecycle fork rejects a source replaced after capture without destination
 			return captured;
 		};
 		SessionManager.captureTranscriptStrict = replaceAfterCapture;
+		const sourceDigest = createHash("sha256")
+			.update(await fs.readFile(sourcePath))
+			.digest("hex");
 		try {
 			await expect(
 				openLifecycleSessionManager(
@@ -302,6 +309,7 @@ test("lifecycle fork rejects a source replaced after capture without destination
 							size: candidate.identity.size,
 							mtimeMs: candidate.identity.mtimeMs,
 							mtimeNs: candidate.identity.mtimeNs.toString(),
+							sha256: sourceDigest,
 						},
 					},
 					targetCwd,
@@ -868,7 +876,7 @@ const endpointGeneration = 1;
 await index.append({ type: "host_registered", sessionId: request.sessionId, locator: { repo: request.cwd, stateRoot: request.stateRoot }, endpointGeneration, pid: process.pid, endpointMtimeMs: (await fs.stat(endpoint)).mtimeMs, lifecycleRequestId: request.effectMarker });
 const source = await fs.readFile(request.sessionPath);
 const stat = await fs.stat(request.sessionPath, { bigint: true });
-await writeSessionLifecycleFailure(request.stateRoot, request.sessionId, request.effectMarker, { phase: "startup", reason: "failed", message: "owned synthetic startup failure" }, { endpointGeneration, fenced: true, runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true }, { digest: createHash("sha256").update(source).digest("hex"), identity: { dev: stat.dev.toString(), ino: stat.ino.toString(), size: Number(stat.size), mtimeMs: Number(stat.mtimeMs), mtimeNs: stat.mtimeNs.toString() } });
+await writeSessionLifecycleFailure(request.stateRoot, request.sessionId, request.effectMarker, { phase: "startup", reason: "failed", message: "owned synthetic startup failure" }, { endpointGeneration, fenced: true, runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true }, { digest: createHash("sha256").update(source).digest("hex"), identity: { dev: stat.dev.toString(), ino: stat.ino.toString(), size: Number(stat.size), mtimeMs: Number(stat.mtimeMs), mtimeNs: stat.mtimeNs.toString(), sha256: createHash("sha256").update(source).digest("hex") } });
 
 await index.append({ type: "host_unregistered", sessionId: request.sessionId, locator: { repo: request.cwd, stateRoot: request.stateRoot }, endpointGeneration, pid: process.pid, lifecycleRequestId: request.effectMarker });
 await fs.rm(endpoint);
@@ -960,6 +968,10 @@ await fs.rm(endpoint);
 		const marker = path.join(stateRoot, `${sessionId}.lifecycle.json`);
 		await expect(fs.stat(artifact)).resolves.toBeDefined();
 		await expect(fs.stat(marker)).resolves.toBeDefined();
+		const retainedArtifact = JSON.parse(await fs.readFile(artifact, "utf8")) as {
+			transcript?: { digest?: unknown; identity?: { sha256?: unknown } };
+		};
+		expect(retainedArtifact.transcript?.digest).toBe(retainedArtifact.transcript?.identity?.sha256);
 
 		await crashing.stop();
 		crashing = undefined;
@@ -1018,6 +1030,24 @@ await fs.rm(endpoint);
 			await expect(
 				fs.stat(path.join(normalRoot, ".gjc", "state", "sdk", `${normalSessionId}.lifecycle.json`)),
 			).rejects.toThrow();
+			expect({
+				preCrashEvidenceRetained: await Promise.all([fs.stat(artifact), fs.stat(marker)]).then(() => true),
+				normalPathEvidenceCleaned: await Promise.all([
+					fs.stat(
+						path.join(
+							normalRoot,
+							".gjc",
+							"state",
+							"sdk",
+							`${normalSessionId}.lifecycle.failure.${normalTerminal.effectMarker}.json`,
+						),
+					),
+					fs.stat(path.join(normalRoot, ".gjc", "state", "sdk", `${normalSessionId}.lifecycle.json`)),
+				]).then(
+					() => false,
+					() => true,
+				),
+			}).toEqual({ preCrashEvidenceRetained: true, normalPathEvidenceCleaned: true });
 		} finally {
 			await normal?.stop();
 			await normalSaved.close();

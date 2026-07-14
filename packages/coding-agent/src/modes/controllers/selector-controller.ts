@@ -1385,10 +1385,7 @@ export class SelectorController {
 	}
 
 	async showSessionSelector(): Promise<void> {
-		const sessions = await SessionManager.list(
-			this.ctx.sessionManager.getCwd(),
-			this.ctx.sessionManager.getSessionDir(),
-		);
+		const sessions = await SessionManager.listForResumePickerReadOnly(this.ctx.sessionManager.getCwd());
 		this.showSelector(done => {
 			const selector = new SessionSelectorComponent(
 				sessions,
@@ -1407,9 +1404,9 @@ export class SelectorController {
 					if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
 						return false;
 					}
-					const storage = new FileSessionStorage();
 					try {
-						await storage.deleteSessionWithArtifacts(session.path);
+						await this.#deleteSession(session.path);
+
 						return true;
 					} catch (err) {
 						throw new Error(`Failed to delete session: ${err instanceof Error ? err.message : String(err)}`, {
@@ -1443,6 +1440,15 @@ export class SelectorController {
 			titleSource?: "auto" | "user" | undefined;
 		};
 		setSessionTerminalTitle(sessionManager.getSessionName?.(), sessionManager.getCwd());
+	}
+
+	async #deleteSession(sessionPath: string): Promise<void> {
+		const sessionManager = this.ctx.sessionManager as { dropSession?: (path: string) => Promise<void> };
+		if (sessionManager.dropSession) {
+			await sessionManager.dropSession(sessionPath);
+			return;
+		}
+		await new FileSessionStorage().deleteSessionWithArtifacts(sessionPath);
 	}
 
 	async #detachActiveSessionBeforeDeletion(sessionPath: string): Promise<boolean> {
@@ -1520,8 +1526,7 @@ export class SelectorController {
 			return;
 		}
 
-		// Delete the session file and artifacts directory
-		await storage.deleteSessionWithArtifacts(sessionFile);
+		await this.#deleteSession(sessionFile);
 
 		// Show session selector
 		this.ctx.showStatus("Current session transcript and artifacts deleted");

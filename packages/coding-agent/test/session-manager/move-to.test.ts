@@ -9,10 +9,11 @@ import {
 	SessionManager,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { stripOuterDoubleQuotes } from "@gajae-code/coding-agent/tools/path-utils";
-import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
+import { getConfigRootDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
 
 // -- helpers ----------------------------------------------------------------
 
+import { resolveManagedScope } from "../../src/session/internal/managed-session-scope";
 import { makeAssistantMessage } from "./helpers";
 
 function getHeader(entries: unknown[]): SessionHeader | undefined {
@@ -31,6 +32,17 @@ function hasAssistantEntry(entries: unknown[]): boolean {
 			"message" in e &&
 			(e as any).message?.role === "assistant",
 	);
+}
+
+function managedDirectoryName(cwd: string): string {
+	const sessionsRoot = getSessionsDir();
+	const resolved = resolveManagedScope({
+		cwd,
+		agentDir: path.resolve(sessionsRoot, ".."),
+		sessionsRoot,
+	});
+	if (resolved.kind !== "resolved") throw new Error(resolved.message);
+	return resolved.scope.directoryName;
 }
 
 // -- stripOuterDoubleQuotes tests -------------------------------------------
@@ -111,6 +123,90 @@ describe("SessionManager.moveTo", () => {
 		expect(hasAssistantEntry(entries)).toBe(true);
 	});
 
+	it("does not replace an existing destination transcript", async () => {
+		const session = SessionManager.create(cwdA);
+		session.appendMessage({ role: "user", content: "source", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const sourceFile = session.getSessionFile()!;
+		const destinationDir = SessionManager.getDefaultSessionDir(cwdB);
+		const destinationFile = path.join(destinationDir, path.basename(sourceFile));
+		fs.writeFileSync(destinationFile, "unrelated destination\n");
+
+		await expect(session.moveTo(cwdB)).rejects.toThrow();
+		expect(fs.readFileSync(destinationFile, "utf8")).toBe("unrelated destination\n");
+		expect(fs.existsSync(sourceFile)).toBe(true);
+	});
+
+	it("retains the authoritative source when a cross-device rollback follows an artifact conflict", async () => {
+		const session = SessionManager.create(cwdA);
+		session.appendMessage({ role: "user", content: "source", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const sourceFile = session.getSessionFile()!;
+		const sourceContent = fs.readFileSync(sourceFile, "utf8");
+		const { path: artifactPath } = await session.allocateArtifactPath("bash");
+		if (!artifactPath) throw new Error("Expected artifact path");
+
+		const destinationFile = path.join(SessionManager.getDefaultSessionDir(cwdB), path.basename(sourceFile));
+		fs.mkdirSync(destinationFile.slice(0, -6), { recursive: true });
+		const originalLink = fs.promises.link;
+		const forceCrossDevice: typeof fs.promises.link = async () => {
+			const error = new Error("cross-device link") as NodeJS.ErrnoException;
+			error.code = "EXDEV";
+			throw error;
+		};
+		fs.promises.link = forceCrossDevice;
+		try {
+			await expect(session.moveTo(cwdB)).rejects.toThrow();
+		} finally {
+			fs.promises.link = originalLink;
+		}
+
+		expect(fs.readFileSync(sourceFile, "utf8")).toBe(sourceContent);
+		expect(fs.existsSync(destinationFile)).toBe(false);
+		expect(fs.existsSync(path.dirname(artifactPath))).toBe(true);
+	});
+
+	it("preserves complete nested artifact topology on a successful EXDEV move", async () => {
+		const session = SessionManager.create(cwdA);
+		session.appendMessage({ role: "user", content: "source", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const sourceFile = session.getSessionFile()!;
+		const { path: artifactPath } = await session.allocateArtifactPath("bash");
+		if (!artifactPath) throw new Error("Expected artifact path");
+		const sourceArtifacts = path.dirname(artifactPath);
+		await fsp.mkdir(path.join(sourceArtifacts, "nested", "empty"), { recursive: true });
+		await fsp.writeFile(artifactPath, "top-level artifact");
+		await fsp.writeFile(path.join(sourceArtifacts, "nested", "payload.txt"), "nested artifact");
+
+		const originalLink = fs.promises.link;
+		const forceCrossDevice: typeof fs.promises.link = async () => {
+			const error = new Error("cross-device link") as NodeJS.ErrnoException;
+			error.code = "EXDEV";
+			throw error;
+		};
+		fs.promises.link = forceCrossDevice;
+		try {
+			await session.moveTo(cwdB);
+		} finally {
+			fs.promises.link = originalLink;
+		}
+
+		const destinationFile = session.getSessionFile()!;
+		const destinationArtifacts = destinationFile.slice(0, -6);
+		expect(fs.existsSync(sourceFile)).toBe(false);
+		expect(fs.existsSync(sourceArtifacts)).toBe(false);
+		expect(await fsp.readFile(path.join(destinationArtifacts, path.basename(artifactPath)), "utf8")).toBe(
+			"top-level artifact",
+		);
+		expect(await fsp.readFile(path.join(destinationArtifacts, "nested", "payload.txt"), "utf8")).toBe(
+			"nested artifact",
+		);
+		expect((await fsp.stat(path.join(destinationArtifacts, "nested", "empty"))).isDirectory()).toBe(true);
+	});
+
 	it("succeeds on fresh session without ENOENT, then deferred persistence works", async () => {
 		const session = SessionManager.create(cwdA);
 		// No messages — file never written to disk
@@ -174,6 +270,14 @@ describe("SessionManager.moveTo", () => {
 
 		const newFile = session.getSessionFile()!;
 		expect(fs.existsSync(newFile)).toBe(true);
+		expect(path.dirname(newFile)).toBe(path.join(getSessionsDir(), managedDirectoryName(cwdB)));
+		const reopened = await SessionManager.open(newFile);
+		try {
+			expect(reopened.getCwd()).toBe(path.resolve(cwdB));
+			expect(reopened.getSessionFile()).toBe(newFile);
+		} finally {
+			await reopened.close();
+		}
 
 		const entries = await loadEntriesFromFile(newFile);
 		const header = getHeader(entries);
@@ -197,6 +301,14 @@ describe("SessionManager.moveTo", () => {
 
 		const newFile = session.getSessionFile()!;
 		expect(fs.existsSync(newFile)).toBe(true);
+		expect(path.dirname(newFile)).toBe(path.join(getSessionsDir(), managedDirectoryName(cwdB)));
+		const reopened = await SessionManager.open(newFile);
+		try {
+			expect(reopened.getCwd()).toBe(path.resolve(cwdB));
+			expect(reopened.getSessionFile()).toBe(newFile);
+		} finally {
+			await reopened.close();
+		}
 
 		// Rewrite must have run (hadSessionFile=true) even though #flushed was reset
 		const entries = await loadEntriesFromFile(newFile);

@@ -3,15 +3,21 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	CURRENT_SESSION_VERSION,
 	type FileEntry,
 	findMostRecentSession,
 	getRecentSessions,
 	loadEntriesFromFile,
 	resolveResumableSession,
 	type SessionHeader,
+	SessionManagedStorageError,
 	SessionManager,
 } from "@gajae-code/coding-agent/session/session-manager";
+
+import { MemorySessionStorage } from "@gajae-code/coding-agent/session/session-storage";
+
 import { getConfigRootDir, getSessionsDir, Snowflake, setAgentDir } from "@gajae-code/utils";
+import { listManagedCandidates, resolveManagedScope } from "../../src/session/internal/managed-session-scope";
 
 describe("loadEntriesFromFile", () => {
 	let tempDir: string;
@@ -201,8 +207,15 @@ describe("SessionManager temp cwd session dirs", () => {
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
-	function expectedTempSessionDirName(tempCwd: string): string {
-		return `-tmp-${path.relative(os.tmpdir(), path.resolve(tempCwd)).replace(/[/\\:]/g, "-")}`;
+	function managedDirectoryName(cwd: string): string {
+		const sessionsRoot = getSessionsDir();
+		const resolved = resolveManagedScope({
+			cwd,
+			agentDir: path.resolve(sessionsRoot, ".."),
+			sessionsRoot,
+		});
+		if (resolved.kind !== "resolved") throw new Error(resolved.message);
+		return resolved.scope.directoryName;
 	}
 
 	function toLegacyAbsoluteSessionDirName(cwd: string): string {
@@ -227,7 +240,7 @@ describe("SessionManager temp cwd session dirs", () => {
 		fs.rmSync(testAgentDir, { recursive: true, force: true });
 	});
 
-	it("stores symlink-equivalent home cwd sessions under home-relative directories", () => {
+	it("stores symlink-equivalent home cwd sessions in the v2 resolver directory", () => {
 		if (process.platform === "win32") return;
 
 		const projectsRoot = path.join(os.homedir(), "Projects");
@@ -246,10 +259,7 @@ describe("SessionManager temp cwd session dirs", () => {
 			const sessionFile = session.getSessionFile();
 			if (!sessionFile) throw new Error("Expected session file path");
 
-			const expectedDir = path.join(
-				getSessionsDir(),
-				`-${path.relative(os.homedir(), fs.realpathSync(aliasedCwd)).replace(/[/\\:]/g, "-")}`,
-			);
+			const expectedDir = path.join(getSessionsDir(), managedDirectoryName(aliasedCwd));
 			expect(path.dirname(sessionFile)).toBe(expectedDir);
 		} finally {
 			fs.rmSync(aliasRoot, { recursive: true, force: true });
@@ -257,7 +267,7 @@ describe("SessionManager temp cwd session dirs", () => {
 		}
 	});
 
-	it("stores temp-root cwd sessions under -tmp-prefixed directories", () => {
+	it("stores temp-root cwd sessions in the v2 resolver directory", () => {
 		const tempCwd = path.join(testAgentDir, `temp-cwd-${Snowflake.next()}`);
 		fs.mkdirSync(tempCwd, { recursive: true });
 
@@ -265,26 +275,32 @@ describe("SessionManager temp cwd session dirs", () => {
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file path");
 
-		expect(path.dirname(sessionFile)).toBe(path.join(getSessionsDir(), expectedTempSessionDirName(tempCwd)));
+		expect(path.dirname(sessionFile)).toBe(path.join(getSessionsDir(), managedDirectoryName(tempCwd)));
 	});
 
-	it("migrates legacy temp-root absolute session dirs to -tmp prefixes", () => {
+	it("retains validated legacy temp-root sessions beside the v2 resolver directory", () => {
 		const tempCwd = path.join(testAgentDir, `legacy-cwd-${Snowflake.next()}`);
 		fs.mkdirSync(tempCwd, { recursive: true });
-
-		const legacyDir = path.join(getSessionsDir(), toLegacyAbsoluteSessionDirName(tempCwd));
-		const markerFile = path.join(legacyDir, "carried.jsonl");
+		const sessionsRoot = getSessionsDir();
+		const legacyDir = path.join(sessionsRoot, toLegacyAbsoluteSessionDirName(tempCwd));
+		const legacyFile = path.join(legacyDir, "carried.jsonl");
+		const legacyTranscript = `${JSON.stringify({ type: "session", id: "legacy-session", timestamp: "2025-01-01T00:00:00Z", cwd: tempCwd })}\n`;
 		fs.mkdirSync(legacyDir, { recursive: true });
-		fs.writeFileSync(markerFile, "marker\n");
+		fs.writeFileSync(legacyFile, legacyTranscript);
 
 		const session = SessionManager.create(tempCwd);
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file path");
 
-		const expectedDir = path.join(getSessionsDir(), expectedTempSessionDirName(tempCwd));
-		expect(fs.existsSync(legacyDir)).toBe(false);
-		expect(path.dirname(sessionFile)).toBe(expectedDir);
-		expect(fs.existsSync(path.join(expectedDir, "carried.jsonl"))).toBe(true);
+		expect(path.dirname(sessionFile)).toBe(path.join(sessionsRoot, managedDirectoryName(tempCwd)));
+		expect(fs.readFileSync(legacyFile, "utf8")).toBe(legacyTranscript);
+		const resolved = resolveManagedScope({ cwd: tempCwd, agentDir: testAgentDir, sessionsRoot });
+		if (resolved.kind !== "resolved") throw new Error(resolved.message);
+		const candidates = listManagedCandidates(resolved.scope);
+		if (candidates.kind !== "complete") throw new Error(candidates.message);
+		expect(candidates.owned).toContainEqual(
+			expect.objectContaining({ path: legacyFile, provenance: "legacy", sessionId: "legacy-session" }),
+		);
 	});
 });
 
@@ -456,5 +472,26 @@ describe("SessionManager legacy session migration persistence", () => {
 			await resumed.close();
 			await session.close();
 		}
+	});
+});
+
+describe("non-file session storage directory boundaries", () => {
+	it("rejects default managed directories while allowing an explicit backend-owned directory", async () => {
+		const storage = new MemorySessionStorage();
+		expect(() => SessionManager.create("/workspace", undefined, storage)).toThrow(SessionManagedStorageError);
+		await expect(SessionManager.continueRecent("/workspace", undefined, storage)).rejects.toThrow(
+			SessionManagedStorageError,
+		);
+
+		const created = SessionManager.create("/workspace", "/backend/sessions", storage);
+		const sessionFile = created.getSessionFile();
+		if (!sessionFile) throw new Error("Expected explicit backend session file");
+		await created.close();
+		storage.writeTextSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: created.getSessionId(), timestamp: new Date().toISOString(), cwd: "/workspace" })}\n`,
+		);
+		const opened = await SessionManager.open(sessionFile, "/backend/sessions", storage);
+		expect(opened.getSessionFile()).toBe(sessionFile);
 	});
 });

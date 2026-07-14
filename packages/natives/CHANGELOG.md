@@ -6,6 +6,10 @@
 
 - Prefer a source-workspace native addon over optional platform packages while validating the current version sentinel on every candidate, so stale local or optional binaries fall through with actionable diagnostics instead of shadowing the active loader (#2168).
 
+### Added
+
+- Added native canonical existing-directory identity and fail-closed owner-only path-security APIs. POSIX identity is lossless UTF-8 canonicalization; Windows resolves local final volume-GUID paths, rejects network paths, and applies/verifies TokenUser protected-DACL security without following reparse points (#2177).
+
 ## [0.10.0] - 2026-07-12
 ### Fixed
 

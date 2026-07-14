@@ -6,14 +6,21 @@
  * pick a repo to create in or a recent session to resume without typing raw
  * paths. Dependency-light + injectable so it is unit-testable over a temp dir.
  */
-import * as fs from "node:fs";
+import { createHash } from "node:crypto";
 import * as path from "node:path";
+import { verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
+import { FileSessionStorage } from "../../session/session-storage";
+import {
+	type LogicalSessionCandidate,
+	listManagedSessionCandidates,
+	resolveManagedSessionScope,
+} from "../session-directory";
 
 /** One ranked recent-session entry surfaced to the picker. */
 export interface RecentSessionEntry {
-	/** Session id (the `.jsonl` file stem). */
+	/** Session id from the validated managed candidate header. */
 	sessionId: string;
-	/** Working directory / repo path, when recoverable from the header. */
+	/** Validated workspace path recorded by the managed candidate. */
 	path?: string;
 	/** Branch, when recoverable from the header. */
 	branch?: string;
@@ -30,8 +37,12 @@ export interface RecentSessionEntry {
 }
 
 export interface RecentActivityDeps {
-	/** Root holding `<encoded-cwd>/<sessionId>.jsonl` history files. */
-	sessionsRoot: string;
+	/** Workspace whose managed sessions will be listed readonly. */
+	cwd: string;
+	/** Agent directory used to resolve the managed session scope. */
+	agentDir?: string;
+	/** Explicit managed root for isolated tests. */
+	sessionsRoot?: string;
 	/** Optional breadcrumb session-file paths (current terminals). */
 	breadcrumbPaths?: string[];
 	/** Max entries to return (default 20). */
@@ -42,27 +53,34 @@ export interface RecentActivityDeps {
 	readInitialLines?: (file: string, maxLines: number) => string[];
 }
 
-function defaultReadInitialLines(file: string, maxLines: number): string[] {
-	try {
-		const lines = fs.readFileSync(file, "utf8").split("\n");
-		return lines.slice(0, maxLines);
-	} catch {
-		return [];
-	}
+function readCandidateInitialLines(
+	candidate: LogicalSessionCandidate,
+	readInitialLines: ((file: string, maxLines: number) => string[]) | undefined,
+): string[] {
+	if (readInitialLines) return readInitialLines(candidate.path, 8);
+	const security = verifyOwnerOnlyPathSecurity(candidate.path, "file");
+	if (!security.ok) throw new Error(`Managed session metadata path is unsafe: ${security.code}`);
+	const snapshot = new FileSessionStorage().readSnapshotSync(candidate.path);
+	const digest = createHash("sha256").update(snapshot.bytes).digest("hex");
+	if (
+		snapshot.stat.dev !== candidate.identity.dev ||
+		snapshot.stat.ino !== candidate.identity.ino ||
+		snapshot.stat.size !== candidate.identity.size ||
+		snapshot.stat.mtimeNs !== candidate.identity.mtimeNs ||
+		digest !== candidate.identity.sha256
+	)
+		throw new Error("Managed session changed after ownership was verified.");
+	return Buffer.from(snapshot.bytes).toString("utf8").split("\n").slice(0, 8);
 }
 
 /** Best-effort header metadata extraction from a session file's first line. */
-function headerMeta(line: string | undefined): { id?: string; path?: string; branch?: string; title?: string } {
+function headerMeta(line: string | undefined): { branch?: string; title?: string } {
 	if (!line) return {};
 	try {
 		const obj = JSON.parse(line) as Record<string, unknown>;
-		// Session headers vary; pull common fields defensively.
-		const id = typeof obj.id === "string" ? obj.id : undefined;
-		const cwd =
-			typeof obj.cwd === "string" ? obj.cwd : typeof obj.projectDir === "string" ? obj.projectDir : undefined;
 		const branch = typeof obj.branch === "string" ? obj.branch : undefined;
 		const title = typeof obj.title === "string" ? obj.title : undefined;
-		return { id, path: cwd, branch, title };
+		return { branch, title };
 	} catch {
 		return {};
 	}
@@ -84,73 +102,55 @@ function isInternalSession(lines: readonly string[]): boolean {
 	return false;
 }
 
-/**
- * The authoritative session id for a history file: the header `id` when present,
- * else the filename stem with a leading `<timestamp>_` prefix stripped (matching
- * SessionManager's `<isoTimestamp>_<id>.jsonl` naming), else the bare stem.
- */
-function sessionIdForFile(stem: string, headerId: string | undefined): string {
-	if (headerId) return headerId;
-	const m = stem.match(/^\d{4}-\d{2}-\d{2}T[\d:.-]+Z?_(.+)$/);
-	return m?.[1] ?? stem;
-}
+/** Lists readonly managed candidates for one workspace, ranked by history-file mtime. */
+export type ListRecentSessionsResult =
+	| { kind: "complete"; entries: RecentSessionEntry[]; warnings: readonly string[] }
+	| { kind: "error"; code: "scope_unavailable" | "managed_scan_failed"; message: string };
 
-/**
- * List recent sessions ranked by history-file mtime (newest first).
- *
- * Scans `<sessionsRoot>/<encoded-cwd>/<sessionId>.jsonl`, stats each file, and
- * returns up to `limit` entries enriched with header metadata and a
- * `currentTerminal` flag for any breadcrumb-referenced session file.
- */
-export function listRecentSessions(deps: RecentActivityDeps): RecentSessionEntry[] {
+export async function listRecentSessions(deps: RecentActivityDeps): Promise<ListRecentSessionsResult> {
 	const limit = deps.limit ?? 20;
 	const includeInternal = deps.includeInternal ?? true;
-	const readInitialLines = deps.readInitialLines ?? defaultReadInitialLines;
+	const readInitialLines = deps.readInitialLines;
 	const breadcrumbs = new Set((deps.breadcrumbPaths ?? []).map(p => path.resolve(p)));
-
-	let projectDirs: string[];
-	try {
-		projectDirs = fs
-			.readdirSync(deps.sessionsRoot, { withFileTypes: true })
-			.filter(d => d.isDirectory())
-			.map(d => path.join(deps.sessionsRoot, d.name));
-	} catch {
-		return [];
-	}
+	const scope = await resolveManagedSessionScope({
+		cwd: deps.cwd,
+		agentDir: deps.agentDir,
+		sessionsRoot: deps.sessionsRoot,
+	});
+	if (scope.kind !== "resolved") return { kind: "error", code: "scope_unavailable", message: scope.message };
+	const listed = await listManagedSessionCandidates({ scope: scope.scope });
+	if (listed.kind !== "complete") return { kind: "error", code: "managed_scan_failed", message: listed.message };
 
 	const entries: RecentSessionEntry[] = [];
-	for (const dir of projectDirs) {
-		let files: string[];
+	for (const candidate of listed.owned) {
+		let initialLines: string[];
 		try {
-			files = fs.readdirSync(dir).filter(name => name.endsWith(".jsonl"));
-		} catch {
-			continue;
+			initialLines = readCandidateInitialLines(candidate, readInitialLines);
+		} catch (error) {
+			return {
+				kind: "error",
+				code: "managed_scan_failed",
+				message: `Could not read managed session metadata: ${error instanceof Error ? error.message : String(error)}`,
+			};
 		}
-		for (const name of files) {
-			const file = path.join(dir, name);
-			let mtimeMs: number;
-			try {
-				mtimeMs = fs.statSync(file).mtimeMs;
-			} catch {
-				continue;
-			}
-			const initialLines = readInitialLines(file, 8);
-			const meta = headerMeta(initialLines[0]);
-			const internal = isInternalSession(initialLines);
-			if (internal && !includeInternal) continue;
-			entries.push({
-				sessionId: sessionIdForFile(name.slice(0, -".jsonl".length), meta.id),
-				path: meta.path,
-				branch: meta.branch,
-				title: meta.title,
-				sessionStateFile: file,
-				mtimeMs,
-				currentTerminal: breadcrumbs.has(path.resolve(file)) || undefined,
-				internal: internal || undefined,
-			});
-		}
+		const meta = headerMeta(initialLines[0]);
+		const internal = isInternalSession(initialLines);
+		if (internal && !includeInternal) continue;
+		entries.push({
+			sessionId: candidate.sessionId,
+			path: candidate.cwd,
+			branch: meta.branch,
+			title: meta.title,
+			sessionStateFile: candidate.path,
+			mtimeMs: candidate.identity.mtimeMs,
+			currentTerminal: breadcrumbs.has(path.resolve(candidate.path)) || undefined,
+			internal: internal || undefined,
+		});
 	}
-
 	entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
-	return entries.slice(0, limit);
+	return {
+		kind: "complete",
+		entries: entries.slice(0, limit),
+		warnings: listed.invalid.map(invalid => `Ignored invalid managed session candidate: ${invalid.code}`),
+	};
 }

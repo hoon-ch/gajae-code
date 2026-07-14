@@ -1,7 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { resolveResumableSession, SessionManager } from "../../session/session-manager";
+import {
+	type DirectoryMigrationPolicy,
+	listManagedSessionCandidates,
+	resolveManagedSessionScope,
+} from "../session-directory";
 import {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
@@ -29,7 +33,18 @@ export interface BrokerSettings {
 	packageGeneration?: string;
 	port?: number;
 	heartbeatTtlMs?: number;
+	/** Broker-owned migration policy. Client lifecycle frames cannot select it. */
+	resolveDirectoryMigration?: (_cwd: string) => Promise<DirectoryMigrationPolicy>;
 }
+
+type ResolvedBrokerSettings = {
+	agentDir: string;
+	packageGeneration: string;
+	port: number;
+	heartbeatTtlMs: number;
+	resolveDirectoryMigration: (_cwd: string) => Promise<DirectoryMigrationPolicy>;
+};
+
 export type BrokerErrorCode =
 	| "idempotency_conflict"
 	| "terminal_uncertain"
@@ -46,10 +61,36 @@ export type BrokerErrorCode =
 	| "cleanup_pending"
 	| (string & {});
 
+export type BrokerCleanupIdentity = {
+	dev: string;
+	ino: string;
+	size: number;
+	mtimeNs: string;
+	sha256: string;
+};
+
+/** Exact retry evidence; detached paths are managed-receipt references, never caller authority. */
 export type BrokerCleanupEvidence = {
 	phase: "artifacts" | "transcript" | "metadata";
-	artifactsIdentity?: { dev: string; ino: string };
-	transcriptIdentity?: { dev: string; ino: string };
+	/** Ledger-bound deletion target; never reconstructed from a retry request. */
+	sessionsRoot?: string;
+	transcriptPath?: string;
+	cwd?: string;
+	metadataRoot?: string;
+	sessionId?: string;
+	artifactsIdentity?: BrokerCleanupIdentity;
+	transcriptIdentity?: BrokerCleanupIdentity;
+	/** Identity-bound lifecycle metadata marker retained when exact cleanup is deferred. */
+	metadataIdentity?: BrokerCleanupIdentity;
+	metadataPath?: string;
+	detachedArtifactsPath?: string;
+	detachedTranscriptPath?: string;
+	/** Durable proof that artifact cleanup completed before transcript mutation. */
+	artifactsRemoved?: boolean;
+	/** Preauthorized no-replace artifact quarantine path persisted before detach. */
+	plannedArtifactsPath?: string;
+	/** Preauthorized no-replace transcript quarantine path persisted before detach. */
+	plannedTranscriptPath?: string;
 };
 export type BrokerResponse =
 	| { ok: true; result?: unknown; indexSeq?: number }
@@ -106,6 +147,8 @@ function normalizeBrokerInput(operation: string, input: Record<string, unknown>)
 		normalized.sourceSessionId = source.value;
 		delete normalized.sourceId;
 	}
+	if (input.directoryMigration !== undefined)
+		return error("invalid_input", "directoryMigration is broker-managed and cannot be selected by clients.");
 
 	if (operation === "session.list") {
 		const resolved = input.resolveSessionId;
@@ -272,7 +315,7 @@ type BrokerLockSnapshot = {
 const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 
 export class Broker {
-	readonly settings: Required<BrokerSettings>;
+	readonly settings: ResolvedBrokerSettings;
 	readonly index: SessionIndex;
 	readonly ledger: LifecycleLedger;
 	discovery: BrokerDiscovery | null = null;
@@ -284,7 +327,13 @@ export class Broker {
 	#heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	#heartbeatWrite: Promise<void> = Promise.resolve();
 	constructor(settings: BrokerSettings) {
-		this.settings = { packageGeneration: "unknown", port: 0, heartbeatTtlMs: BROKER_HEARTBEAT_TTL_MS, ...settings };
+		this.settings = {
+			agentDir: settings.agentDir,
+			packageGeneration: settings.packageGeneration ?? "unknown",
+			port: settings.port ?? 0,
+			heartbeatTtlMs: settings.heartbeatTtlMs ?? BROKER_HEARTBEAT_TTL_MS,
+			resolveDirectoryMigration: settings.resolveDirectoryMigration ?? (async () => "copy-retain"),
+		};
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
 		this.#lock = path.join(settings.agentDir, "sdk", "broker.lock");
@@ -543,15 +592,21 @@ export class Broker {
 			const resolveSessionId = typeof input.resolveSessionId === "string" ? input.resolveSessionId : undefined;
 			const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
 			if (resolveSessionId && cwd) {
-				const sessionDir = SessionManager.getDefaultSessionDir(cwd, this.settings.agentDir);
-				const match = await resolveResumableSession(resolveSessionId, cwd, sessionDir);
+				const scope = await resolveManagedSessionScope({ cwd, agentDir: this.settings.agentDir });
+				const listed =
+					scope.kind === "resolved" ? await listManagedSessionCandidates({ scope: scope.scope }) : undefined;
+				const matches =
+					listed?.kind === "complete"
+						? listed.owned.filter(candidate => candidate.sessionId === resolveSessionId)
+						: [];
+				const match = matches.length === 1 ? matches[0] : undefined;
 				return {
 					ok: true,
 					result: {
 						...result,
 						savedSession:
-							match && match.session.id === resolveSessionId
-								? { id: match.session.id, path: match.session.path }
+							match && match.sessionId === resolveSessionId
+								? { id: match.sessionId, path: match.path }
 								: undefined,
 					},
 					indexSeq: result.indexSeq,
@@ -576,7 +631,21 @@ export class Broker {
 		await prev;
 		try {
 			const begun = await this.ledger.begin(identity, requestHash);
-			if (begun.kind === "replay") return begun.entry.response as BrokerResponse;
+			if (begun.kind === "replay") {
+				const replay = begun.entry.response as BrokerResponse;
+				if (!(!replay.ok && replay.error.code === "cleanup_pending")) return replay;
+				const cleanup = replay.error.cleanup;
+				if (!cleanup) return replay;
+				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
+				const response = outcome.response;
+				await this.ledger.transition(identity, response.ok ? "terminal_ok" : "terminal_error", {
+					response,
+					responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
+					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
+					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
+				});
+				return response;
+			}
 			if (begun.kind === "idempotency_conflict")
 				return error("idempotency_conflict", "idempotency key was used with a different request");
 			if (begun.kind === "terminal_uncertain")

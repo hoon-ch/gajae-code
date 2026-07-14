@@ -25,10 +25,20 @@ import {
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { deriveLifecycleDeadlines, readSessionLifecycleLaunchRequest } from "../src/sdk/broker/lifecycle";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
+import { prepareManagedSessionScopeForWrite, resolveManagedScope } from "../src/session/internal/managed-session-scope";
 import { SessionManager } from "../src/session/session-manager";
 import { FileSessionStorage } from "../src/session/session-storage";
 
 const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-"));
+async function managedSessionPath(agentDir: string, cwd: string, sessionId: string): Promise<string> {
+	await fs.mkdir(cwd, { recursive: true });
+	const sessionsRoot = getSessionsDir(agentDir);
+	const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
+	if (resolved.kind !== "resolved") throw new Error(resolved.message);
+	const prepared = await prepareManagedSessionScopeForWrite(resolved.scope);
+	if (prepared.kind !== "resolved") throw new Error(prepared.message);
+	return path.join(prepared.scope.directoryPath, `${sessionId}.jsonl`);
+}
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const brokerEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 
@@ -144,19 +154,25 @@ it("fails closed when compiled marker evidence disagrees", () => {
 	}
 });
 
-it("SDK lifecycle model presets reach the session host parser", () => {
+it("SDK lifecycle model presets reach the session host parser", async () => {
+	const agentDir = await temp();
+	const cwd = path.join(agentDir, "repo");
+	await fs.mkdir(cwd);
 	const request = readSessionLifecycleLaunchRequest(
 		JSON.stringify({
 			operation: "session.create",
 			sessionId: "session-1",
-			stateRoot: "/repo/.gjc/state",
-
-			cwd: "/repo",
+			stateRoot: path.join(cwd, ".gjc", "state"),
+			cwd,
 			modelPreset: "codex-eco",
 			...deriveLifecycleDeadlines(Date.now(), 10_000),
 		}),
 	);
-	expect(lifecycleArgs(request, "/repo", "/agent").mpreset).toBe("codex-eco");
+	try {
+		expect((await lifecycleArgs(request, cwd, agentDir)).mpreset).toBe("codex-eco");
+	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
 });
 
 it("SDK lifecycle launch requests require a worktree identity", () => {
@@ -164,6 +180,31 @@ it("SDK lifecycle launch requests require a worktree identity", () => {
 		readSessionLifecycleLaunchRequest(
 			JSON.stringify({ operation: "session.create", sessionId: "session-1", stateRoot: "/state" }),
 		),
+	).toThrow("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
+});
+
+it("SDK lifecycle transcript authority requires and preserves a full sha256 identity", () => {
+	const cwd = "/workspace/repo";
+	const request = {
+		operation: "session.resume",
+		sessionId: "session-1",
+		stateRoot: path.join(cwd, ".gjc", "state"),
+		cwd,
+		sessionPath: "/agent/sessions/session-1.jsonl",
+		sessionIdentity: {
+			dev: "1",
+			ino: "2",
+			size: 3,
+			mtimeMs: 4,
+			mtimeNs: "5",
+			sha256: "a".repeat(64),
+		},
+		...deriveLifecycleDeadlines(Date.now(), 10_000),
+	};
+	expect(readSessionLifecycleLaunchRequest(JSON.stringify(request)).sessionIdentity?.sha256).toBe("a".repeat(64));
+	const { sha256: _sha256, ...withoutHash } = request.sessionIdentity;
+	expect(() =>
+		readSessionLifecycleLaunchRequest(JSON.stringify({ ...request, sessionIdentity: withoutHash })),
 	).toThrow("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
 });
 async function waitForDiscovery(agentDir: string) {
@@ -539,13 +580,14 @@ describe("SDK broker identity and discovery", () => {
 		const dir = await temp();
 		const liveCwd = path.join(dir, "live-workspace");
 		const requestedCwd = path.join(dir, "requested-workspace");
+		await fs.mkdir(liveCwd, { recursive: true });
+		await fs.mkdir(requestedCwd, { recursive: true });
 		const stateRoot = path.join(liveCwd, ".gjc", "state");
 		const sessionId = "shared-live-session";
 		const sessionDir = SessionManager.getDefaultSessionDir(liveCwd, dir);
 		const sessionPath = path.join(sessionDir, `${sessionId}.jsonl`);
 		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
 		const broker = new Broker({ agentDir: dir });
-		await fs.mkdir(requestedCwd, { recursive: true });
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.mkdir(sessionDir, { recursive: true });
 		await fs.writeFile(
@@ -612,6 +654,7 @@ describe("SDK broker identity and discovery", () => {
 		const sessions = path.join(getSessionsDir(dir), "project");
 		const requested = path.join(sessions, "requested.jsonl");
 		const other = path.join(sessions, "other.jsonl");
+		await fs.mkdir(cwd, { recursive: true });
 		await fs.mkdir(sessions, { recursive: true });
 		await fs.writeFile(requested, `${JSON.stringify({ type: "session", id: "requested" })}\n`);
 		await fs.writeFile(other, `${JSON.stringify({ type: "session", id: "other" })}\n`);
@@ -626,7 +669,10 @@ describe("SDK broker identity and discovery", () => {
 				),
 			).toEqual({
 				ok: false,
-				error: { code: "invalid_input", message: "session.delete path does not contain the requested session." },
+				error: {
+					code: "invalid_input",
+					message: "session.delete path is not an owned managed session for the configured cwd.",
+				},
 			});
 			expect(await fs.readFile(other, "utf8")).toContain('"other"');
 			expect(
@@ -639,7 +685,7 @@ describe("SDK broker identity and discovery", () => {
 				ok: false,
 				error: {
 					code: "invalid_input",
-					message: "session.delete path is outside the configured session storage root.",
+					message: "session.delete path is not an owned managed session for the configured cwd.",
 				},
 			});
 			expect(await fs.readFile(requested, "utf8")).toContain('"requested"');
@@ -659,7 +705,7 @@ describe("SDK broker identity and discovery", () => {
 				ok: false,
 				error: {
 					code: "invalid_input",
-					message: "session.delete path is a symlink.",
+					message: "session.delete path is not an owned managed session for the configured cwd.",
 				},
 			});
 			expect(await fs.readFile(external, "utf8")).toContain('"requested"');
@@ -723,11 +769,10 @@ describe("SDK broker identity and discovery", () => {
 		const cwd = path.join(dir, "workspace");
 		const stateRoot = path.join(cwd, ".gjc", "state");
 		const sessionId = "verified-delete";
-		const sessionPath = path.join(getSessionsDir(dir), "project", `${sessionId}.jsonl`);
+		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
 		const artifactsDir = sessionPath.slice(0, -6);
 		const broker = new Broker({ agentDir: dir });
 		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
-		await fs.mkdir(cwd, { recursive: true });
 		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
 		await fs.mkdir(artifactsDir);
 		await fs.writeFile(path.join(artifactsDir, "artifact.txt"), "artifact");
@@ -759,11 +804,10 @@ describe("SDK broker identity and discovery", () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
 		const sessionId = "pending-delete";
-		const sessionPath = path.join(getSessionsDir(dir), `${sessionId}.jsonl`);
+		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
 		const broker = new Broker({ agentDir: dir });
 		const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
 		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
-		await fs.mkdir(cwd, { recursive: true });
 		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
 		await broker.start();
 		FileSessionStorage.prototype.deleteSessionVerified = async () => ({
@@ -771,8 +815,9 @@ describe("SDK broker identity and discovery", () => {
 
 			phase: "artifacts" as const,
 			error: new Error("artifact cleanup denied"),
-			artifactsIdentity: { dev: 7n, ino: 8n },
-			transcriptIdentity: { dev: 5n, ino: 6n },
+			artifactsIdentity: { dev: 7n, ino: 8n, size: 9, mtimeNs: 10n, sha256: "a".repeat(64) },
+			detachedArtifactsPath: path.join(dir, ".gjc-delete-test"),
+			transcriptIdentity: { dev: 5n, ino: 6n, size: 7, mtimeNs: 8n, sha256: "b".repeat(64) },
 		});
 		try {
 			const pending = await broker.handleRequest(
@@ -780,18 +825,28 @@ describe("SDK broker identity and discovery", () => {
 				{ sessionId, sessionPath, cwd },
 				"pending-delete-key",
 			);
-			expect(pending).toEqual({
+			expect(pending).toMatchObject({
 				ok: false,
 				error: {
 					code: "cleanup_pending",
 					message: "Saved session cleanup is pending in artifacts: artifact cleanup denied",
 					cleanup: {
 						phase: "artifacts",
-						artifactsIdentity: { dev: "7", ino: "8" },
-						transcriptIdentity: { dev: "5", ino: "6" },
+						sessionId,
+						cwd,
+						sessionsRoot: path.join(dir, "sessions"),
+						transcriptPath: sessionPath,
+						metadataRoot: path.join(cwd, ".gjc", "state"),
+						artifactsIdentity: { dev: "7", ino: "8", size: 9, mtimeNs: "10", sha256: "a".repeat(64) },
+						transcriptIdentity: { dev: "5", ino: "6", size: 7, mtimeNs: "8", sha256: "b".repeat(64) },
+						detachedArtifactsPath: path.join(dir, ".gjc-delete-test"),
 					},
 				},
 			});
+			if (!pending.ok) {
+				expect(pending.error.cleanup?.plannedArtifactsPath).toMatch(/\.gjc-delete-[\w-]+-artifacts$/);
+				expect(pending.error.cleanup?.plannedTranscriptPath).toMatch(/\.gjc-delete-[\w-]+-transcript$/);
+			}
 			expect(
 				await broker.handleRequest("session.delete", { sessionId, sessionPath, cwd }, "pending-delete-key"),
 			).toEqual(pending);

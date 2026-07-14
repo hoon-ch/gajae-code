@@ -1,6 +1,10 @@
+import { createHash, randomUUID } from "node:crypto";
+
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
+
 import { isEnoent, pathIsWithin, peekFile, toError } from "@gajae-code/utils";
 
 const utf8Decoder = new TextDecoder("utf-8");
@@ -155,10 +159,13 @@ export interface SessionStorage {
 // Verified hard-delete identity + typed partial-cleanup evidence
 // =============================================================================
 
-/** Exact (dev, ino) identity fields used for ACP authorization binding. */
+/** Exact authorization evidence for a transcript or artifact path. */
 export interface SessionStorageFileIdentity {
 	dev: bigint;
 	ino: bigint;
+	size: number;
+	mtimeNs: bigint;
+	sha256: string;
 }
 
 /** Kind of verification failure surfaced by {@link deleteSessionVerified}. */
@@ -209,6 +216,16 @@ export interface VerifiedSessionDeleteTarget {
 	 * fails closed. Omit on first attempt or to accept recorded absence.
 	 */
 	expectedArtifactsIdentity?: SessionStorageFileIdentity;
+	/** Identity-bound quarantine path retained when recursive artifact cleanup failed. */
+	detachedArtifactsPath?: string;
+	/** Identity-bound quarantine path retained when transcript unlink deferred cleanup. */
+	detachedTranscriptPath?: string;
+	/** Caller-published, no-replace quarantine pathname for the next artifact detach. */
+	plannedArtifactsPath?: string;
+	/** Caller-published, no-replace quarantine pathname for the next transcript detach. */
+	plannedTranscriptPath?: string;
+	/** Set only after a durable caller receipt records successful artifact removal. */
+	artifactsRemoved?: true;
 }
 
 /**
@@ -218,6 +235,7 @@ export interface VerifiedSessionDeleteTarget {
  * `deleted` and never `{}`.
  */
 export type VerifiedSessionDeleteResult =
+	| { kind: "artifacts_removed"; phase: "artifacts"; transcriptIdentity: SessionStorageFileIdentity }
 	| { kind: "deleted" }
 	| {
 			kind: "cleanup_pending";
@@ -225,6 +243,8 @@ export type VerifiedSessionDeleteResult =
 			error: Error;
 			/** Artifact directory identity at failure time; undefined when absent. */
 			artifactsIdentity: SessionStorageFileIdentity | undefined;
+			/** Identity-bound quarantine path retained when recursive cleanup failed. */
+			detachedArtifactsPath: string;
 			/** Transcript identity (unchanged) for retry binding. */
 			transcriptIdentity: SessionStorageFileIdentity;
 	  }
@@ -234,6 +254,8 @@ export type VerifiedSessionDeleteResult =
 			error: Error;
 			/** Transcript identity at failure time for retry binding. */
 			transcriptIdentity: SessionStorageFileIdentity;
+			/** Optional identity-bound transcript quarantine path for restart cleanup. */
+			detachedTranscriptPath?: string;
 	  };
 
 /** Default OS-close dispatcher: a direct `fs.closeSync`. */
@@ -242,6 +264,73 @@ const defaultCloseAdapter: SessionStorageWriterCloseAdapter = {
 		fs.closeSync(fd);
 	},
 };
+
+type NativeSecurity = { ok: true } | { ok: false; code: string };
+
+type NativeExactUnlinkResult = { ok: true; detachedPath?: string } | { ok: false; code: string; detachedPath?: string };
+type NativeExactUnlink = (
+	path: string,
+	identity: {
+		dev: bigint;
+		ino: bigint;
+		size: bigint;
+		mtimeNs: bigint;
+		/** Required for regular-file deletion; directories are identity-bound only. */
+		sha256?: string;
+		directory?: boolean;
+		/** Optional caller-planned no-replace quarantine destination component. */
+		quarantineName?: string;
+	},
+) => NativeExactUnlinkResult;
+
+function nativeExactUnlink(
+	pathname: string,
+	identity: {
+		dev: bigint;
+		ino: bigint;
+		size: bigint;
+		mtimeNs: bigint;
+		/** Required for regular-file deletion; directories are identity-bound only. */
+		sha256?: string;
+		directory?: boolean;
+		quarantineName?: string;
+	},
+): NativeExactUnlinkResult {
+	return (native.exactUnlink as unknown as NativeExactUnlink)(pathname, identity);
+}
+
+function exactUnlinkFailure(result: NativeExactUnlinkResult): SessionDeleteVerificationError {
+	if (result.ok) throw new Error("Expected exact unlink failure");
+	const kind: VerifiedDeleteFailureKind =
+		result.code === "reparse_point" || result.code === "not_regular_file"
+			? "symlink"
+			: result.code === "identity_mismatch"
+				? "identity"
+				: "stat";
+	return new SessionDeleteVerificationError(kind, `Exact transcript deletion rejected: ${result.code}`);
+}
+function secureOwnerOnlyFile(pathname: string): void {
+	const applied = native.applyOwnerOnlyPathSecurity(pathname, "file") as NativeSecurity;
+	if (!applied.ok) throw new Error(`Owner-only security rejected ${pathname}: ${applied.code}`);
+	const verified = native.verifyOwnerOnlyPathSecurity(pathname, "file") as NativeSecurity;
+	if (!verified.ok) throw new Error(`Owner-only security rejected ${pathname}: ${verified.code}`);
+}
+
+/** Reject a symlink/junction/reparse component before a storage path is created or opened. */
+function assertNoReparsePath(pathname: string): void {
+	const resolved = path.resolve(pathname);
+	const parsed = path.parse(resolved);
+	let current = parsed.root;
+	for (const part of resolved.slice(parsed.root.length).split(path.sep)) {
+		if (!part) continue;
+		current = path.join(current, part);
+		try {
+			if (fs.lstatSync(current).isSymbolicLink()) throw new Error(`Unsafe reparse storage path: ${current}`);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
+}
 
 // FinalizationRegistry to clean up leaked file descriptors
 const writerRegistry = new FinalizationRegistry<number>(fd => {
@@ -264,14 +353,25 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter ?? defaultCloseAdapter;
 		const flags = options?.flags ?? "a";
-		// Ensure parent directory exists
 		const dir = path.dirname(fpath);
-		if (!fs.existsSync(dir)) {
-			fs.mkdirSync(dir, { recursive: true });
+		assertNoReparsePath(dir);
+		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		assertNoReparsePath(dir);
+		assertNoReparsePath(fpath);
+		// The creation mode prevents a POSIX exposure before the native verifier runs.
+		const openFlags =
+			(flags === "w"
+				? fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC
+				: fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND) | (fs.constants.O_NOFOLLOW ?? 0);
+		const fd = fs.openSync(fpath, openFlags, 0o600);
+		try {
+			// Do not rely on directory inheritance: secure and verify every file independently.
+			secureOwnerOnlyFile(fpath);
+		} catch (error) {
+			fs.closeSync(fd);
+			throw error;
 		}
-		// Open file once, keep fd for lifetime
-		this.#fd = fs.openSync(fpath, flags === "w" ? "w" : "a");
-		// Register for cleanup if abandoned without close()
+		this.#fd = fd;
 		writerRegistry.register(this, this.#fd, this);
 	}
 
@@ -491,28 +591,60 @@ export class FileSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * Delete a session file and its artifacts directory.
-	 * Artifacts are stored in a sibling directory with the same name minus .jsonl extension.
+	 * Delete a session transcript and sibling artifacts through the same identity-bound
+	 * artifact-first protocol used by managed deletion.
 	 */
 	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
-		// Delete the session file itself
-		await this.unlink(sessionPath);
-
-		// Compute artifacts directory: /path/to/session.jsonl -> /path/to/session
-		const artifactsDir = sessionPath.slice(0, -6);
-
-		// Delete artifacts directory if it exists. Missing directories are fine, but
-		// surface real cleanup failures because the session file is already gone.
+		const snapshot = this.readSnapshotSync(sessionPath);
+		const header = parseFirstJsonlLine(snapshot.bytes);
+		if (header?.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string") {
+			throw new SessionDeleteVerificationError("header", "Transcript header is not a valid session header");
+		}
+		const planPath = path.join(
+			path.dirname(sessionPath),
+			`.gjc-delete-${path.basename(sessionPath, ".jsonl")}-${randomUUID()}.cleanup-plan.json`,
+		);
+		const plannedArtifactsPath = path.join(path.dirname(sessionPath), `.gjc-delete-${randomUUID()}-artifacts`);
+		const plannedTranscriptPath = path.join(path.dirname(sessionPath), `.gjc-delete-${randomUUID()}-transcript`);
+		const planFd = fs.openSync(planPath, "wx", 0o600);
 		try {
-			await fsp.rm(artifactsDir, { recursive: true, force: true });
-		} catch (err) {
-			const error = toError(err);
-			throw new Error(
-				`Session file deleted but failed to remove artifacts directory ${artifactsDir}: ${error.message}`,
-				{
-					cause: error,
-				},
+			fs.writeFileSync(
+				planFd,
+				`${JSON.stringify({ schemaVersion: 1, sessionPath, plannedArtifactsPath, plannedTranscriptPath })}\n`,
 			);
+			fs.fsyncSync(planFd);
+		} finally {
+			fs.closeSync(planFd);
+		}
+		const target = {
+			sessionsRoot: path.dirname(sessionPath),
+			transcriptPath: sessionPath,
+			sessionId: header.id,
+			cwd: header.cwd,
+			transcriptIdentity: {
+				dev: snapshot.stat.dev,
+				ino: snapshot.stat.ino,
+				size: snapshot.stat.size,
+				mtimeNs: snapshot.stat.mtimeNs,
+				sha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
+			},
+			plannedArtifactsPath,
+			plannedTranscriptPath,
+		} satisfies VerifiedSessionDeleteTarget;
+		const artifacts = await this.deleteSessionVerified(target);
+		if (artifacts.kind === "cleanup_pending") {
+			throw new Error(`Session cleanup is pending in ${artifacts.phase}: ${artifacts.error.message}`, {
+				cause: artifacts.error,
+			});
+		}
+		const result =
+			artifacts.kind === "artifacts_removed"
+				? await this.deleteSessionVerified({ ...target, artifactsRemoved: true })
+				: artifacts;
+		if (result.kind === "cleanup_pending") {
+			throw new Error(`Session cleanup is pending in ${result.phase}: ${result.error.message}`, {
+				cause: result.error,
+			});
 		}
 	}
 	/**
@@ -521,68 +653,255 @@ export class FileSessionStorage implements SessionStorage {
 	 * evidence; identity/symlink/containment/header/cwd mismatch throws.
 	 */
 	async deleteSessionVerified(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult> {
-		const { sessionsRoot, transcriptPath, sessionId, cwd, transcriptIdentity, expectedArtifactsIdentity } = target;
+		const {
+			sessionsRoot,
+			transcriptPath,
+			sessionId,
+			cwd,
+			transcriptIdentity,
+			expectedArtifactsIdentity,
+			detachedArtifactsPath,
+			detachedTranscriptPath,
+			plannedArtifactsPath,
+			plannedTranscriptPath,
+			artifactsRemoved,
+		} = target;
+		try {
+			assertNoReparsePath(sessionsRoot);
+			assertNoReparsePath(transcriptPath);
+		} catch (err) {
+			throw new SessionDeleteVerificationError("symlink", "Sessions root or transcript path is a symlink", {
+				cause: toError(err),
+			});
+		}
 		if (!transcriptPath.endsWith(".jsonl")) {
 			throw new SessionDeleteVerificationError("containment", "Transcript path is not a .jsonl file");
 		}
 		if (!pathIsWithin(sessionsRoot, transcriptPath)) {
 			throw new SessionDeleteVerificationError("containment", "Transcript is outside the sessions root");
 		}
-		const initial = this.#verifiedReadAndHeader(transcriptPath, sessionId, cwd);
-		const initialStat = initial.snapshot.stat;
-		if (initialStat.dev !== transcriptIdentity.dev || initialStat.ino !== transcriptIdentity.ino) {
+		if (
+			!plannedArtifactsPath ||
+			!plannedTranscriptPath ||
+			path.dirname(plannedArtifactsPath) !== path.dirname(transcriptPath) ||
+			path.dirname(plannedTranscriptPath) !== path.dirname(transcriptPath) ||
+			!path.basename(plannedArtifactsPath).startsWith(".gjc-delete-") ||
+			!path.basename(plannedTranscriptPath).startsWith(".gjc-delete-") ||
+			plannedArtifactsPath === plannedTranscriptPath
+		) {
+			throw new SessionDeleteVerificationError(
+				"artifacts",
+				"Verified deletion requires caller-persisted quarantine paths",
+			);
+		}
+		const cleanupTranscriptPath = detachedTranscriptPath ?? transcriptPath;
+		const hasDetachedTranscript = detachedTranscriptPath !== undefined;
+		if (
+			detachedTranscriptPath &&
+			(path.dirname(detachedTranscriptPath) !== path.dirname(transcriptPath) ||
+				!path.basename(detachedTranscriptPath).startsWith(".gjc-delete-"))
+		) {
+			throw new SessionDeleteVerificationError("identity", "Detached transcript cleanup evidence is invalid");
+		}
+		const initial = hasDetachedTranscript ? undefined : this.#verifiedReadAndHeader(transcriptPath, sessionId, cwd);
+		const initialStat = initial?.snapshot.stat;
+		const initialDigest = initial ? createHash("sha256").update(initial.snapshot.bytes).digest("hex") : undefined;
+		if (
+			initialStat &&
+			(initialStat.dev !== transcriptIdentity.dev ||
+				initialStat.ino !== transcriptIdentity.ino ||
+				initialStat.size !== transcriptIdentity.size ||
+				initialStat.mtimeNs !== transcriptIdentity.mtimeNs ||
+				initialDigest !== transcriptIdentity.sha256)
+		) {
 			throw new SessionDeleteVerificationError("identity", "Transcript identity does not match authorization");
 		}
-		const parentIdentity = this.#directoryIdentity(path.dirname(transcriptPath));
 
+		const parentIdentity = this.#directoryIdentity(path.dirname(transcriptPath));
+		if (detachedArtifactsPath) {
+			if (
+				!expectedArtifactsIdentity ||
+				path.dirname(detachedArtifactsPath) !== path.dirname(transcriptPath) ||
+				!path.basename(detachedArtifactsPath).startsWith(".gjc-delete-")
+			) {
+				throw new SessionDeleteVerificationError("artifacts", "Detached artifact cleanup evidence is invalid");
+			}
+			const detachedIdentity = this.#optionalDirectoryIdentity(detachedArtifactsPath);
+			if (
+				!detachedIdentity ||
+				detachedIdentity.dev !== expectedArtifactsIdentity.dev ||
+				detachedIdentity.ino !== expectedArtifactsIdentity.ino ||
+				detachedIdentity.size !== expectedArtifactsIdentity.size ||
+				detachedIdentity.mtimeNs !== expectedArtifactsIdentity.mtimeNs ||
+				detachedIdentity.sha256 !== expectedArtifactsIdentity.sha256
+			) {
+				throw new SessionDeleteVerificationError("artifacts", "Detached artifact identity changed before retry");
+			}
+			const detach = nativeExactUnlink(detachedArtifactsPath, {
+				dev: expectedArtifactsIdentity.dev,
+				ino: expectedArtifactsIdentity.ino,
+				size: BigInt(expectedArtifactsIdentity.size),
+				mtimeNs: expectedArtifactsIdentity.mtimeNs,
+				directory: true,
+				quarantineName: path.basename(plannedArtifactsPath),
+			});
+			if (!detach.ok || !detach.detachedPath) {
+				throw new SessionDeleteVerificationError(
+					"artifacts",
+					`Exact detached artifact cleanup rejected: ${detach.ok ? "missing_path" : detach.code}`,
+				);
+			}
+			try {
+				await fsp.rm(detach.detachedPath, { recursive: true, force: true });
+			} catch (err) {
+				return {
+					kind: "cleanup_pending",
+					phase: "artifacts",
+					error: toError(err),
+					artifactsIdentity: expectedArtifactsIdentity,
+					detachedArtifactsPath: detach.detachedPath,
+					transcriptIdentity,
+				};
+			}
+		}
+
+		if (artifactsRemoved && (detachedArtifactsPath || expectedArtifactsIdentity)) {
+			throw new SessionDeleteVerificationError(
+				"artifacts",
+				"Artifact phase receipt conflicts with pending artifact cleanup",
+			);
+		}
 		const artifactsDir = transcriptPath.slice(0, -6);
 		const artifactsIdentity = this.#optionalDirectoryIdentity(artifactsDir);
-		if (artifactsIdentity) {
+		if (artifactsRemoved && artifactsIdentity) {
+			throw new SessionDeleteVerificationError(
+				"artifacts",
+				"Artifact path reappeared after durable artifact-phase completion",
+			);
+		}
+		if (!artifactsIdentity && expectedArtifactsIdentity && !detachedArtifactsPath && !artifactsRemoved) {
+			// A pending receipt authorizes this exact artifact identity. Its absence is the
+			// only crash-recoverable evidence after detach+recursive removal completed
+			// before the caller could append the artifacts_removed receipt.
+			return { kind: "artifacts_removed", phase: "artifacts", transcriptIdentity };
+		}
+		if (artifactsIdentity && !artifactsRemoved) {
 			if (
 				expectedArtifactsIdentity &&
 				(artifactsIdentity.dev !== expectedArtifactsIdentity.dev ||
-					artifactsIdentity.ino !== expectedArtifactsIdentity.ino)
+					artifactsIdentity.ino !== expectedArtifactsIdentity.ino ||
+					artifactsIdentity.size !== expectedArtifactsIdentity.size ||
+					artifactsIdentity.mtimeNs !== expectedArtifactsIdentity.mtimeNs ||
+					artifactsIdentity.sha256 !== expectedArtifactsIdentity.sha256)
 			) {
 				throw new SessionDeleteVerificationError(
 					"artifacts",
 					"Artifact directory identity does not match recorded cleanup evidence",
 				);
 			}
+			const artifactStat = fs.lstatSync(artifactsDir, { bigint: true });
+			if (
+				artifactStat.isSymbolicLink() ||
+				!artifactStat.isDirectory() ||
+				artifactStat.dev !== artifactsIdentity.dev ||
+				artifactStat.ino !== artifactsIdentity.ino
+			) {
+				throw new SessionDeleteVerificationError("artifacts", "Artifact directory changed before deletion");
+			}
+			const detach = nativeExactUnlink(artifactsDir, {
+				dev: artifactStat.dev,
+				ino: artifactStat.ino,
+				size: artifactStat.size,
+				mtimeNs: artifactStat.mtimeNs,
+				directory: true,
+				quarantineName: path.basename(plannedArtifactsPath),
+			});
+			if (!detach.ok || !detach.detachedPath) {
+				throw new SessionDeleteVerificationError(
+					"artifacts",
+					`Exact artifact detach rejected: ${detach.ok ? "missing_path" : detach.code}`,
+				);
+			}
 			try {
-				await fsp.rm(artifactsDir, { recursive: true, force: true });
+				await fsp.rm(detach.detachedPath, { recursive: true, force: true });
 			} catch (err) {
 				return {
 					kind: "cleanup_pending",
 					phase: "artifacts",
 					error: toError(err),
 					artifactsIdentity,
-					transcriptIdentity: { dev: initialStat.dev, ino: initialStat.ino },
+					detachedArtifactsPath: detach.detachedPath,
+					transcriptIdentity,
 				};
 			}
 		}
-
+		if (!artifactsRemoved) return { kind: "artifacts_removed", phase: "artifacts", transcriptIdentity };
+		if (hasDetachedTranscript) {
+			const deletion = nativeExactUnlink(cleanupTranscriptPath, {
+				dev: transcriptIdentity.dev,
+				ino: transcriptIdentity.ino,
+				size: BigInt(transcriptIdentity.size),
+				mtimeNs: transcriptIdentity.mtimeNs,
+				sha256: transcriptIdentity.sha256,
+				quarantineName: path.basename(plannedTranscriptPath),
+			});
+			if (!deletion.ok) {
+				const error = exactUnlinkFailure(deletion);
+				if (error.kind === "identity" || error.kind === "symlink") throw error;
+				return {
+					kind: "cleanup_pending",
+					phase: "transcript",
+					error,
+					transcriptIdentity,
+					detachedTranscriptPath: deletion.detachedPath ?? detachedTranscriptPath,
+				};
+			}
+			return { kind: "deleted" };
+		}
+		if (!initialStat || !initialDigest)
+			throw new SessionDeleteVerificationError("stat", "Transcript cleanup state is invalid");
 		const revalidate = this.#verifiedReadAndHeader(transcriptPath, sessionId, cwd);
 		const revalidateStat = revalidate.snapshot.stat;
-		if (revalidateStat.dev !== initialStat.dev || revalidateStat.ino !== initialStat.ino) {
+		const revalidateDigest = createHash("sha256").update(revalidate.snapshot.bytes).digest("hex");
+		if (
+			revalidateStat.dev !== initialStat.dev ||
+			revalidateStat.ino !== initialStat.ino ||
+			revalidateStat.size !== initialStat.size ||
+			revalidateStat.mtimeNs !== initialStat.mtimeNs ||
+			revalidateDigest !== initialDigest
+		) {
 			throw new SessionDeleteVerificationError(
 				"identity",
 				"Transcript identity changed after artifact removal (replacement detected)",
 			);
 		}
+
 		const parentIdentityNow = this.#directoryIdentity(path.dirname(transcriptPath));
 		if (parentIdentityNow.dev !== parentIdentity.dev || parentIdentityNow.ino !== parentIdentity.ino) {
 			throw new SessionDeleteVerificationError("identity", "Parent directory identity changed during deletion");
 		}
 
-		try {
-			await this.unlink(transcriptPath);
-		} catch (err) {
-			if (isEnoent(err)) return { kind: "deleted" };
+		this.#assertPathMatchesSnapshot(transcriptPath, revalidate.snapshot);
+		if (!Number.isSafeInteger(revalidateStat.size) || revalidateStat.size < 0) {
+			throw new SessionDeleteVerificationError("identity", "Transcript size cannot be bound exactly for deletion");
+		}
+		const deletion = nativeExactUnlink(transcriptPath, {
+			dev: initialStat.dev,
+			ino: initialStat.ino,
+			size: BigInt(initialStat.size),
+			mtimeNs: initialStat.mtimeNs,
+			sha256: initialDigest,
+			quarantineName: path.basename(plannedTranscriptPath),
+		});
+		if (!deletion.ok) {
+			const error = exactUnlinkFailure(deletion);
+			if (error.kind === "identity" || error.kind === "symlink") throw error;
 			return {
 				kind: "cleanup_pending",
 				phase: "transcript",
-				error: toError(err),
-				transcriptIdentity: { dev: revalidateStat.dev, ino: revalidateStat.ino },
+				error,
+				transcriptIdentity,
+				detachedTranscriptPath: deletion.detachedPath,
 			};
 		}
 		return { kind: "deleted" };
@@ -627,6 +946,27 @@ export class FileSessionStorage implements SessionStorage {
 		return { snapshot };
 	}
 
+	#assertPathMatchesSnapshot(transcriptPath: string, snapshot: SessionStorageSnapshot): void {
+		let named: fs.BigIntStats;
+		try {
+			named = fs.lstatSync(transcriptPath, { bigint: true });
+		} catch (err) {
+			throw new SessionDeleteVerificationError("stat", "Transcript path could not be revalidated", {
+				cause: toError(err),
+			});
+		}
+		if (
+			named.isSymbolicLink() ||
+			!named.isFile() ||
+			named.dev !== snapshot.stat.dev ||
+			named.ino !== snapshot.stat.ino ||
+			Number(named.size) !== snapshot.stat.size ||
+			named.mtimeNs !== snapshot.stat.mtimeNs
+		) {
+			throw new SessionDeleteVerificationError("identity", "Transcript path changed before deletion");
+		}
+	}
+
 	#directoryIdentity(dirPath: string): SessionStorageFileIdentity {
 		let stat: fs.BigIntStats;
 		try {
@@ -637,7 +977,7 @@ export class FileSessionStorage implements SessionStorage {
 		if (stat.isSymbolicLink() || !stat.isDirectory()) {
 			throw new SessionDeleteVerificationError("symlink", "Directory is a symlink or not a directory");
 		}
-		return { dev: stat.dev, ino: stat.ino };
+		return { dev: stat.dev, ino: stat.ino, size: Number(stat.size), mtimeNs: stat.mtimeNs, sha256: "" };
 	}
 
 	#optionalDirectoryIdentity(dirPath: string): SessionStorageFileIdentity | undefined {
@@ -660,7 +1000,7 @@ export class FileSessionStorage implements SessionStorage {
 			// Fail closed before any mutation.
 			throw new SessionDeleteVerificationError("artifacts", "Artifact path exists but is not a directory");
 		}
-		return { dev: stat.dev, ino: stat.ino };
+		return { dev: stat.dev, ino: stat.ino, size: Number(stat.size), mtimeNs: stat.mtimeNs, sha256: "" };
 	}
 }
 

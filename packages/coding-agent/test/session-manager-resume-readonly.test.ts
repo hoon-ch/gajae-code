@@ -536,21 +536,21 @@ describe("SessionManager read-only resume", () => {
 		await opened.manager.close();
 	});
 
-	it("finds legacy default inventory without writes and excludes it for explicit directories", async () => {
+	it("requires explicit directories for custom-storage resume inventory without writes", async () => {
 		const storage = new WriteTrackingStorage();
-		const cwd = path.join(os.tmpdir(), "gjc-resume-readonly-legacy");
+		const cwd = makeTempDir();
 		const legacyName = `--${path
 			.resolve(cwd)
 			.replace(/^[/\\]/, "")
 			.replace(/[/\\:]/g, "-")}--`;
 		const legacyPath = path.join(getSessionsDir(), legacyName, "legacy.jsonl");
 		const explicitPath = "/explicit/current.jsonl";
-		storage.writeTextSync(legacyPath, sessionText("legacy"));
+		storage.writeTextSync(legacyPath, sessionText("legacy").replace('"cwd":"/cwd"', `"cwd":${JSON.stringify(cwd)}`));
 		storage.writeTextSync(explicitPath, sessionText("explicit"));
 		storage.writes = 0;
 
 		const defaults = await SessionManager.listForResumePickerReadOnly(cwd, undefined, storage);
-		expect(defaults.map(session => session.id)).toEqual(["legacy"]);
+		expect(defaults).toEqual([]);
 		expect(await SessionManager.listForResumePickerReadOnly(cwd, "/explicit", storage)).toHaveLength(1);
 		expect(storage.writes).toBe(0);
 	});

@@ -846,6 +846,8 @@ export function daemonCloseSession(
 export function daemonResumeSession(
 	env: NodeJS.ProcessEnv = process.env,
 	opts: {
+		agentDir?: string;
+		/** Explicit managed root for isolated tests. */
 		sessionsRoot?: string;
 		listSessions?: (env: NodeJS.ProcessEnv) => GjcTmuxSessionStatus[];
 		ownerIsolationProbe?: OwnerIsolationProbe;
@@ -886,21 +888,27 @@ export function daemonResumeSession(
 		// blindly spawning `gjc --resume <prefix>` against a non-authoritative id.
 		let resumeId = target.sessionIdOrPrefix;
 		let resumeCwd = target.path;
-		if (opts.sessionsRoot) {
-			const saved = listRecentSessions({ sessionsRoot: opts.sessionsRoot, limit: 1000 });
-			const prefixed = saved.filter(
-				s => s.sessionId === target.sessionIdOrPrefix || s.sessionId.startsWith(target.sessionIdOrPrefix),
-			);
-			const exact = prefixed.filter(s => s.sessionId === target.sessionIdOrPrefix);
-			const resolved = exact.length > 0 ? exact : prefixed;
-			if (resolved.length === 0) return { notFound: true };
-			if (resolved.length > 1) {
-				return { ambiguous: resolved.map(s => ({ sessionId: s.sessionId, path: s.path })) };
-			}
-			const selected = resolved[0]!;
-			resumeId = selected.sessionId;
-			resumeCwd = selected.path;
+		if (!target.path || (!opts.agentDir && !opts.sessionsRoot)) return { notFound: true };
+		const recent = await listRecentSessions({
+			cwd: target.path,
+			agentDir: opts.agentDir,
+			sessionsRoot: opts.sessionsRoot,
+			limit: 1000,
+		});
+		if (recent.kind === "error") throw new Error(`gjc_lifecycle_saved_sessions_unavailable: ${recent.message}`);
+		const saved = recent.entries;
+		const prefixed = saved.filter(
+			s => s.sessionId === target.sessionIdOrPrefix || s.sessionId.startsWith(target.sessionIdOrPrefix),
+		);
+		const exact = prefixed.filter(s => s.sessionId === target.sessionIdOrPrefix);
+		const resolved = exact.length > 0 ? exact : prefixed;
+		if (resolved.length === 0) return { notFound: true };
+		if (resolved.length > 1) {
+			return { ambiguous: resolved.map(s => ({ sessionId: s.sessionId, path: s.path })) };
 		}
+		const selected = resolved[0]!;
+		resumeId = selected.sessionId;
+		resumeCwd = selected.path;
 		const resolvedResumeCwd = resumeCwd ? path.resolve(resumeCwd) : undefined;
 		const resumeCwdStat = resolvedResumeCwd ? fs.statSync(resolvedResumeCwd, { throwIfNoEntry: false }) : undefined;
 		if (typeof resolvedResumeCwd !== "string" || !resumeCwdStat?.isDirectory()) {
@@ -1230,8 +1238,8 @@ export function attachLifecycleControl(server: ControlServerLike, deps: Orchestr
 export function buildOrchestratorDeps(input: {
 	pairedChatId: string;
 	agentNotificationsDir: string;
-	/** Root of saved session histories (`<agentDir>/sessions`), for resume resolution. */
-	sessionsRoot?: string;
+	/** Agent directory used for readonly managed-session resume resolution. */
+	agentDir: string;
 	env?: NodeJS.ProcessEnv;
 }): OrchestratorDeps {
 	const env = input.env ?? process.env;
@@ -1253,7 +1261,7 @@ export function buildOrchestratorDeps(input: {
 		},
 		spawnCreate: daemonSpawnCreate(env),
 		closeSession: daemonCloseSession(env),
-		resumeSession: daemonResumeSession(env, { sessionsRoot: input.sessionsRoot }),
+		resumeSession: daemonResumeSession(env, { agentDir: input.agentDir }),
 		newLifecycleRequestId: () => `lc-${crypto.randomUUID()}`,
 		newSessionId: () => `s${crypto.randomUUID().slice(0, 8)}`,
 	};

@@ -17,7 +17,6 @@ const nativeBindings = loadNative();
 nativeBindings.initNativeCrashDiagnostics?.();
 // --- generated native exports (do not edit) ---
 // classes
-export const ComputerController = nativeBindings.ComputerController;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const MacOSPowerAssertion = nativeBindings.MacOSPowerAssertion;
 export const NotificationControlServer = nativeBindings.NotificationControlServer;
@@ -29,13 +28,17 @@ export const Shell = nativeBindings.Shell;
 // functions
 export const __piNativesV0_10_1 = nativeBindings.__piNativesV0_10_1;
 export const applyBashFixups = nativeBindings.applyBashFixups;
+export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;
 export const astEdit = nativeBindings.astEdit;
 export const astGrep = nativeBindings.astGrep;
+export const canonicalExistingDirectoryIdentity = nativeBindings.canonicalExistingDirectoryIdentity;
 export const computerScreenshot = nativeBindings.computerScreenshot;
 export const copyToClipboard = nativeBindings.copyToClipboard;
 export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;
 export const diffLines = nativeBindings.diffLines;
 export const encodeSixel = nativeBindings.encodeSixel;
+export const exactRestore = nativeBindings.exactRestore;
+export const exactUnlink = nativeBindings.exactUnlink;
 export const executeShell = nativeBindings.executeShell;
 export const extractSegments = nativeBindings.extractSegments;
 export const fuzzyFind = nativeBindings.fuzzyFind;
@@ -73,6 +76,7 @@ export const summarizeCode = nativeBindings.summarizeCode;
 export const supportsLanguage = nativeBindings.supportsLanguage;
 export const truncateLinesToWidth = nativeBindings.truncateLinesToWidth;
 export const truncateToWidth = nativeBindings.truncateToWidth;
+export const verifyOwnerOnlyPathSecurity = nativeBindings.verifyOwnerOnlyPathSecurity;
 export const visibleWidth = nativeBindings.visibleWidth;
 export const visibleWidths = nativeBindings.visibleWidths;
 export const wrapTextWithAnsi = nativeBindings.wrapTextWithAnsi;

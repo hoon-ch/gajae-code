@@ -5,7 +5,6 @@ import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "../src/config/model-registry";
-import { Settings } from "../src/config/settings";
 import type { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
@@ -14,6 +13,12 @@ import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 import { getAskAnswerSource } from "../src/tools/ask-answer-registry";
+import { cleanupFixtureRoot } from "./helpers/fixture-broker-cleanup";
+import {
+	createNotificationFixtureRoot,
+	isolatedNotificationSettings,
+	registerNotificationRuntime,
+} from "./helpers/notification-settings";
 
 /**
  * Regression for "the SDK notification transport spawns a new session instead of renaming":
@@ -134,7 +139,7 @@ async function startAndConnect(harness: ReturnType<typeof createHarness>): Promi
 
 test("session_switch publishes successor SDK authority only after AgentSession restore commits", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-post-commit-switch-"));
-	tempDirs.push(cwd);
+	const agentDir = path.join(cwd, ".gjc", "agent");
 	const authStorage = await AuthStorage.create(path.join(cwd, "testauth.db"));
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected bundled model");
@@ -176,13 +181,21 @@ test("session_switch publishes successor SDK authority only after AgentSession r
 		},
 	} as unknown as ExtensionRunner;
 
+	const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
 	try {
 		session = new AgentSession({
 			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
 			sessionManager: currentSessionManager,
-			settings: Settings.isolated(),
+			settings: isolatedNotificationSettings(agentDir),
 			modelRegistry: new ModelRegistry(authStorage, path.join(cwd, "models.yml")),
 			extensionRunner,
+		});
+		registerNotificationRuntime(cleanup, {
+			key: "post-commit-switch",
+			shutdown: async () => {
+				await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+			},
+			dispose: () => session!.dispose(),
 		});
 		await handlers.get("session_start")!({ type: "session_start" }, ctx);
 		await waitFor(() => fs.existsSync(predecessorEndpoint), 4000, "predecessor endpoint");
@@ -192,8 +205,7 @@ test("session_switch publishes successor SDK authority only after AgentSession r
 		await waitFor(() => fs.existsSync(successorEndpoint), 4000, "successor endpoint");
 		expect(fs.existsSync(predecessorEndpoint)).toBe(false);
 	} finally {
-		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
-		await session?.dispose();
+		await cleanupFixtureRoot(cleanup);
 		authStorage.close();
 	}
 }, 30000);

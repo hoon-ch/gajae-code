@@ -21,6 +21,7 @@ import {
 	ensureBroker,
 	reapSpawnedBrokerForTest,
 	registerBrokerOwnerForTest,
+	startFixtureBrokerWithLeaseForTest,
 } from "../src/sdk/broker/ensure";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { deriveLifecycleDeadlines, readSessionLifecycleLaunchRequest } from "../src/sdk/broker/lifecycle";
@@ -935,6 +936,85 @@ describe("SDK broker identity and discovery", () => {
 			});
 		} finally {
 			server.stop(true);
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("fixture broker lease authority", () => {
+	it("mints one lease for a fresh child and never mints one from an existing owner", async () => {
+		const dir = await temp();
+		try {
+			const started = await startFixtureBrokerWithLeaseForTest({ agentDir: dir });
+			expect(typeof started.discovery.pid).toBe("number");
+			await expect(startFixtureBrokerWithLeaseForTest({ agentDir: dir })).rejects.toThrow(
+				"fixture_broker_lease_unavailable",
+			);
+			const firstClose = started.lease.close();
+			const secondClose = started.lease.close();
+			expect(secondClose).toBe(firstClose);
+			await firstClose;
+			await started.lease.close();
+			expect(brokerOwnerForTest(dir)).toBeUndefined();
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("rejects a fixture lease that joins discovery-mode startup without claiming its owner", async () => {
+		const dir = await temp();
+		try {
+			const discovery = ensureBroker({ agentDir: dir });
+			await expect(startFixtureBrokerWithLeaseForTest({ agentDir: dir })).rejects.toThrow(
+				"fixture_broker_lease_unavailable",
+			);
+			await discovery;
+			const owner = brokerOwnerForTest(dir);
+			expect(owner).toBeDefined();
+			await owner?.stop();
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("rejects a concurrent second fixture lease and keeps independent roots isolated", async () => {
+		const leftDir = await temp();
+		const rightDir = await temp();
+		try {
+			const leftStart = startFixtureBrokerWithLeaseForTest({ agentDir: leftDir });
+			await expect(startFixtureBrokerWithLeaseForTest({ agentDir: leftDir })).rejects.toThrow(
+				"fixture_broker_lease_unavailable",
+			);
+			const [left, right] = await Promise.all([
+				leftStart,
+				startFixtureBrokerWithLeaseForTest({ agentDir: rightDir }),
+			]);
+			await left.lease.close();
+			expect(await readBrokerDiscovery(rightDir)).toMatchObject({
+				pid: right.discovery.pid,
+				incarnation: right.discovery.incarnation,
+			});
+			expect(brokerOwnerForTest(rightDir)).toBeDefined();
+			await right.lease.close();
+		} finally {
+			await brokerOwnerForTest(leftDir)?.stop();
+			await brokerOwnerForTest(rightDir)?.stop();
+			await fs.rm(leftDir, { recursive: true, force: true });
+			await fs.rm(rightDir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("rejects external discovery without changing its broker", async () => {
+		const dir = await temp();
+		const broker = new Broker({ agentDir: dir });
+		await broker.start();
+		try {
+			await expect(startFixtureBrokerWithLeaseForTest({ agentDir: dir })).rejects.toThrow(
+				"fixture_broker_lease_unavailable",
+			);
+			expect((await readBrokerDiscovery(dir))?.pid).toBe(process.pid);
+		} finally {
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
 		}

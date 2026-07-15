@@ -44,6 +44,62 @@ jobs:
         id: plan
         run: bun scripts/ci-dev-affected.ts --matrix-json
 
+  broker-fixture-lease:
+    name: Broker fixture lease regression / ${{ matrix.platform }}
+    needs: [affected-plan]
+    if: ${{ needs.affected-plan.outputs.relevant == 'true' }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, platform: linux, arch: x64, variant: baseline }
+          - { os: macos-15-intel, platform: darwin, arch: x64, variant: baseline }
+          - { os: windows-latest, platform: win32, arch: x64, variant: baseline }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "24"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3"
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+        with:
+          toolchain: nightly-2026-04-29
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: broker-fixture-${{ matrix.platform }}-${{ matrix.arch }}
+          cache-on-failure: true
+          cache-workspace-crates: true
+      - name: Cache bun dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+      - name: Install system dependencies
+        if: matrix.platform == 'linux'
+        run: bash scripts/ci-install-system-deps.sh
+      - run: bun install --frozen-lockfile
+      - name: Build local native addon
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          TARGET_VARIANTS: ${{ matrix.variant }}
+        run: bun run ci:build:native
+      - name: Run portable broker fixture regressions
+        shell: bash
+        run: |
+          bun test packages/coding-agent/test/sdk-broker.test.ts \
+            packages/coding-agent/test/fixture-broker-cleanup.test.ts \
+            packages/coding-agent/test/sdk-default-model-selection-e2e.test.ts \
+            packages/coding-agent/test/notifications-file-redaction.test.ts \
+            packages/coding-agent/test/notifications-live-stream.test.ts \
+            packages/coding-agent/test/notifications-postmortem-close.test.ts \
+            packages/coding-agent/test/notifications-session-switch.test.ts \
+            packages/coding-agent/test/notifications-turn-ordering.test.ts
+
   # Native addon build runs at most once per run and publishes the built `.node`
   # files as an artifact the runtime-dependent shards download. A content-hash
   # cache of the native sources lets PRs that don't touch crates/natives restore

@@ -25,6 +25,12 @@ import {
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { daemonPaths, ensureTelegramDaemonRunning } from "../src/sdk/bus/telegram-daemon";
 import { SessionManager } from "../src/session/session-manager";
+import { cleanupFixtureRoot } from "./helpers/fixture-broker-cleanup";
+import {
+	createNotificationFixtureRoot,
+	isolatedNotificationSettings,
+	registerNotificationRuntime,
+} from "./helpers/notification-settings";
 
 const BASE_CFG: NotificationConfig = {
 	enabled: false,
@@ -348,10 +354,11 @@ describe("notifications config", () => {
 	});
 	test("settings-enabled subagent sessions do not register the notifications extension", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-subagent-"));
-		tempDirs.push(cwd);
+		const agentDir = path.join(cwd, ".gjc", "agent");
+		const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
 		const previous = process.env.GJC_NOTIFICATIONS;
 		delete process.env.GJC_NOTIFICATIONS;
-		const settings = Settings.isolated({
+		const settings = isolatedNotificationSettings(agentDir, {
 			"notifications.enabled": true,
 			"notifications.telegram.botToken": " ",
 			"notifications.telegram.chatId": "\t",
@@ -361,14 +368,12 @@ describe("notifications config", () => {
 			"notifications.discord.parentChannelId": "discord-parent",
 		});
 
-		const disposers: Array<() => Promise<void>> = [];
-
 		try {
 			resetSettingsForTest();
-			await Settings.init({ inMemory: true, cwd, agentDir: cwd });
+			await Settings.init({ inMemory: true, cwd, agentDir });
 			const topLevel = await createAgentSession({
 				cwd,
-				agentDir: cwd,
+				agentDir,
 				sessionManager: SessionManager.inMemory(cwd),
 				settings,
 				model: getBundledModel("openai", "gpt-4o-mini"),
@@ -381,11 +386,17 @@ describe("notifications config", () => {
 				enableMCP: false,
 				enableLsp: false,
 			});
-			disposers.push(() => topLevel.session.dispose());
+			registerNotificationRuntime(cleanup, {
+				key: "top-level",
+				shutdown: async () => {
+					await topLevel.session.extensionRunner?.emit({ type: "session_shutdown" });
+				},
+				dispose: () => topLevel.session.dispose(),
+			});
 
 			const subagent = await createAgentSession({
 				cwd,
-				agentDir: cwd,
+				agentDir,
 				sessionManager: SessionManager.inMemory(cwd),
 				settings,
 				model: getBundledModel("openai", "gpt-4o-mini"),
@@ -399,10 +410,16 @@ describe("notifications config", () => {
 				enableLsp: false,
 				taskDepth: 1,
 			});
-			disposers.push(() => subagent.session.dispose());
+			registerNotificationRuntime(cleanup, {
+				key: "subagent",
+				shutdown: async () => {
+					await subagent.session.extensionRunner?.emit({ type: "session_shutdown" });
+				},
+				dispose: () => subagent.session.dispose(),
+			});
 			const parentPrefixSubagent = await createAgentSession({
 				cwd,
-				agentDir: cwd,
+				agentDir,
 				sessionManager: SessionManager.inMemory(cwd),
 				settings,
 				model: getBundledModel("openai", "gpt-4o-mini"),
@@ -416,10 +433,16 @@ describe("notifications config", () => {
 				enableLsp: false,
 				parentTaskPrefix: "0-Sub",
 			});
-			disposers.push(() => parentPrefixSubagent.session.dispose());
+			registerNotificationRuntime(cleanup, {
+				key: "parent-prefix-subagent",
+				shutdown: async () => {
+					await parentPrefixSubagent.session.extensionRunner?.emit({ type: "session_shutdown" });
+				},
+				dispose: () => parentPrefixSubagent.session.dispose(),
+			});
 			const agentTypeOnlySubagent = await createAgentSession({
 				cwd,
-				agentDir: cwd,
+				agentDir,
 				sessionManager: SessionManager.inMemory(cwd),
 				settings,
 				model: getBundledModel("openai", "gpt-4o-mini"),
@@ -433,10 +456,16 @@ describe("notifications config", () => {
 				enableLsp: false,
 				currentAgentType: "executor",
 			});
-			disposers.push(() => agentTypeOnlySubagent.session.dispose());
+			registerNotificationRuntime(cleanup, {
+				key: "agent-type-only-subagent",
+				shutdown: async () => {
+					await agentTypeOnlySubagent.session.extensionRunner?.emit({ type: "session_shutdown" });
+				},
+				dispose: () => agentTypeOnlySubagent.session.dispose(),
+			});
 			const explicitExtensionSubagent = await createAgentSession({
 				cwd,
-				agentDir: cwd,
+				agentDir,
 				sessionManager: SessionManager.inMemory(cwd),
 				settings,
 				model: getBundledModel("openai", "gpt-4o-mini"),
@@ -450,7 +479,13 @@ describe("notifications config", () => {
 				enableLsp: false,
 				taskDepth: 1,
 			});
-			disposers.push(() => explicitExtensionSubagent.session.dispose());
+			registerNotificationRuntime(cleanup, {
+				key: "explicit-extension-subagent",
+				shutdown: async () => {
+					await explicitExtensionSubagent.session.extensionRunner?.emit({ type: "session_shutdown" });
+				},
+				dispose: () => explicitExtensionSubagent.session.dispose(),
+			});
 			await topLevel.session.extensionRunner?.emit({ type: "session_start" });
 			await subagent.session.extensionRunner?.emit({ type: "session_start" });
 			await parentPrefixSubagent.session.extensionRunner?.emit({ type: "session_start" });
@@ -486,7 +521,7 @@ describe("notifications config", () => {
 			expect(fs.existsSync(explicitExtensionSubagentEndpoint)).toBe(false);
 			expect(fs.existsSync(daemonPaths(cwd).roots)).toBe(false);
 		} finally {
-			await Promise.all(disposers.reverse().map(dispose => dispose()));
+			await cleanupFixtureRoot(cleanup);
 			if (previous === undefined) {
 				delete process.env.GJC_NOTIFICATIONS;
 			} else {
@@ -498,13 +533,14 @@ describe("notifications config", () => {
 
 	test("sessionScope=primary keeps a canonical SDK endpoint while suppressing GJC-spawned child delivery", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-notif-spawned-"));
-		tempDirs.push(cwd);
+		const agentDir = path.join(cwd, ".gjc", "agent");
+		const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
 		const previousNotif = process.env.GJC_NOTIFICATIONS;
 		const previousSpawn = process.env.GJC_SPAWNED_BY_SESSION;
 		delete process.env.GJC_NOTIFICATIONS;
 		delete process.env.GJC_SPAWNED_BY_SESSION;
 		const adapterSettings = (scope: "all" | "primary"): Settings =>
-			Settings.isolated({
+			isolatedNotificationSettings(agentDir, {
 				"notifications.enabled": true,
 				"notifications.discord.botToken": "discord-token",
 				"notifications.discord.applicationId": "discord-application",
@@ -514,11 +550,10 @@ describe("notifications config", () => {
 			});
 		const primarySettings = adapterSettings("primary");
 		const allSettings = adapterSettings("all");
-		const disposers: Array<() => Promise<void>> = [];
 		const spawn = async (settings: Settings) =>
 			createAgentSession({
 				cwd,
-				agentDir: cwd,
+				agentDir,
 				sessionManager: SessionManager.inMemory(cwd),
 				settings,
 				model: getBundledModel("openai", "gpt-4o-mini"),
@@ -534,25 +569,43 @@ describe("notifications config", () => {
 		const endpointFor = (sessionId: string): string => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		try {
 			resetSettingsForTest();
-			await Settings.init({ inMemory: true, cwd, agentDir: cwd });
+			await Settings.init({ inMemory: true, cwd, agentDir });
 
 			// 1. A spawned child under primary keeps the mandatory SDK endpoint,
 			// while the session-scoped delivery guard above suppresses notifications.
 			process.env.GJC_SPAWNED_BY_SESSION = "parent-abc";
 			const suppressed = await spawn(primarySettings);
-			disposers.push(() => suppressed.session.dispose());
+			registerNotificationRuntime(cleanup, {
+				key: "suppressed",
+				shutdown: async () => {
+					await suppressed.session.extensionRunner?.emit({ type: "session_shutdown" });
+				},
+				dispose: () => suppressed.session.dispose(),
+			});
 			expect(process.env.GJC_SPAWNED_BY_SESSION).toBeUndefined();
 
 			// 2. Spawned child under the default "all" scope still registers.
 			process.env.GJC_SPAWNED_BY_SESSION = "parent-abc";
 			const preserved = await spawn(allSettings);
-			disposers.push(() => preserved.session.dispose());
+			registerNotificationRuntime(cleanup, {
+				key: "preserved",
+				shutdown: async () => {
+					await preserved.session.extensionRunner?.emit({ type: "session_shutdown" });
+				},
+				dispose: () => preserved.session.dispose(),
+			});
 
 			// 3. Spawned child under primary WITH explicit opt-in keeps its endpoint.
 			process.env.GJC_SPAWNED_BY_SESSION = "parent-abc";
 			process.env.GJC_NOTIFICATIONS = "1";
 			const optedIn = await spawn(primarySettings);
-			disposers.push(() => optedIn.session.dispose());
+			registerNotificationRuntime(cleanup, {
+				key: "opted-in",
+				shutdown: async () => {
+					await optedIn.session.extensionRunner?.emit({ type: "session_shutdown" });
+				},
+				dispose: () => optedIn.session.dispose(),
+			});
 			delete process.env.GJC_NOTIFICATIONS;
 
 			await suppressed.session.extensionRunner?.emit({ type: "session_start" });
@@ -563,7 +616,7 @@ describe("notifications config", () => {
 			expect(fs.existsSync(endpointFor(preserved.session.sessionId))).toBe(true);
 			expect(fs.existsSync(endpointFor(optedIn.session.sessionId))).toBe(true);
 		} finally {
-			await Promise.all(disposers.reverse().map(dispose => dispose()));
+			await cleanupFixtureRoot(cleanup);
 			if (previousNotif === undefined) delete process.env.GJC_NOTIFICATIONS;
 			else process.env.GJC_NOTIFICATIONS = previousNotif;
 			if (previousSpawn === undefined) delete process.env.GJC_SPAWNED_BY_SESSION;

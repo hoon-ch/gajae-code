@@ -57,6 +57,10 @@ jobs:
           - { os: macos-15-intel, platform: darwin, arch: x64, variant: baseline }
           - { os: windows-latest, platform: win32, arch: x64, variant: baseline }
     runs-on: ${{ matrix.os }}
+    env:
+      TMPDIR: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4

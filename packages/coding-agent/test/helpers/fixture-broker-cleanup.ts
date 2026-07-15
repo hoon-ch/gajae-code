@@ -58,7 +58,20 @@ export function createFixtureBrokerEnvironment(root: string, agentDir: string): 
 		GJC_CODING_AGENT_DIR: agentDir,
 		PI_CODING_AGENT_DIR: agentDir,
 	};
-	for (const key of ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"] as const) {
+	for (const key of [
+		"PATH",
+		"LANG",
+		"LC_ALL",
+		"LC_CTYPE",
+		"TZ",
+		"SYSTEMROOT",
+		"COMSPEC",
+		"PATHEXT",
+		"WINDIR",
+		"TEMP",
+		"TMP",
+		"TMPDIR",
+	] as const) {
 		if (process.env[key] !== undefined) environment[key] = process.env[key];
 	}
 	return environment;
